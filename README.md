@@ -25,19 +25,17 @@ stealing**, **bounded** queues, and **zero dependencies**. Based on Leis et al.,
 - [Install](#install)
 - [Getting started](#getting-started)
 - [When to use it — and when not to](#when-to-use-it--and-when-not-to)
-- [Sizing: small inputs and few workers cost nothing](#sizing-small-inputs-and-few-workers-cost-nothing)
 - [Compared to traditional Go](#compared-to-traditional-go)
 - [Pipeline](#pipeline)
 - [Adapters (sources)](#adapters-sources)
 - [Streaming and resource usage](#streaming-and-resource-usage)
-- [Allocations](#allocations)
 - [Errors and cancellation](#errors-and-cancellation)
 - [Reusable executor and stats](#reusable-executor-and-stats)
 - [Options](#options)
 - [How it works](#how-it-works)
-- [Benchmarks](#benchmarks)
 - [Package layout](#package-layout)
 - [API reference](#api-reference)
+- [Benchmarks](#benchmarks)
 
 ## Install
 
@@ -106,14 +104,14 @@ func main() {
 - **You want cancellation and error propagation** without hand-rolling a pool.
 - **You do not want to tune it.** Small inputs run on the caller and few-morsel
   runs use few workers, so the same call is right for one item and ten million
-  (see [Sizing](#sizing-small-inputs-and-few-workers-cost-nothing)).
+  (see [Benchmarks](#benchmarks)).
 
 **Poor fit**
 
 - **Trivial work per element over a large input.** The library calls your
   callback once per element, so when an element costs a few ns the call overhead
-  dominates: a plain `for` loop is ~2.5–4× faster (1M `sum += v`: 351 µs vs
-  862 µs at 16 workers). More workers narrow the gap but cannot close it. Small
+  dominates: a plain `for` loop is ~2.5–3× faster (1M `sum += v`: 321 µs vs
+  880 µs at 16 workers). More workers narrow the gap but cannot close it. Small
   inputs are unaffected — they run on the caller.
 - **Strict global ordering of results.** `Collect`, `MapSeq`, and iterator
   `Reduce` are unordered; only `MapSlice` preserves order.
@@ -126,37 +124,6 @@ func main() {
   smaller tool, and just as valid. The library also does it — `MaxWorkers(n)`
   bounds the concurrency — and pulls ahead once there is CPU work or a stream
   (files, rows) to process.
-
-## Sizing: small inputs and few workers cost nothing
-
-You never have to guess a "right" `MaxWorkers`, and a small job never pays for a
-pool it does not need. The same call is optimal for one element and for ten
-million:
-
-- **One morsel runs on the calling goroutine.** If the input fits in a single
-  morsel — or `MaxWorkers` is 1 — there is no pool, no queue and no extra
-  goroutine; the loop runs in place. The trigger is the input size, not
-  `MaxWorkers`, so `MaxWorkers(8)` with a small input still runs inline.
-- **Workers track the backlog.** The pool grows to `min(MaxWorkers, morsels
-  queued)`, so a two-morsel run uses two workers, not eight. `MaxWorkers` is a
-  ceiling, never a target.
-- **Idle workers steal.** When a worker drains its queue it takes from a busy
-  peer, so uneven work — a few slow items — still finishes together.
-
-Measured (`go test -bench -benchtime=3s`, `GOMAXPROCS=20`):
-
-| benchmark | ns/op | B/op | allocs/op |
-|---|---:|---:|---:|
-| `TinyInput/sequential` — 100 elements, on the caller | **344 ns** | 304 | 6 |
-| `TinyInput/pooled` — 100 elements, forced through the pool | 15.2 µs | 7.4 KB | 32 |
-| `MorselWorkers/1` — 1M heavy, one worker (caller) | 55.0 ms | 152 | 4 |
-| `BaselineLoop` — 1M heavy, plain `for` loop | 59.7 ms | 0 | 0 |
-
-A tiny input is ~**44×** cheaper and ~**24×** lighter on allocation when it stays
-on the caller, and a single worker is within ~10% of a hand-written loop: when
-there is nothing to parallelize, the engine adds essentially nothing. A run that
-starts only a few workers allocates only those: the queues, the worker state and
-the overflow buffer are all created on demand.
 
 ## Compared to traditional Go
 
@@ -469,69 +436,6 @@ Resource sketch at defaults (`MaxWorkers=GOMAXPROCS`, `MorselSize=256`,
 | CPU when idle | ~0 (parked) |
 | CPU when busy | ≤ `MaxWorkers` cores |
 
-### Reading a file
-
-`Lines` materializes one `string` per line, so line-oriented processing pays an
-allocation **per line**. `Chunks` reads the file in blocks, and splitting lines
-inside a block allocates nothing per line. The engine also consumes a stdlib
-iterator directly, since `Iter` takes any `iter.Seq[T]`.
-
-Same 1M-line (~14 MB) file read from disk, `GOMAXPROCS=20`,
-`go test -bench -benchtime=3s`:
-
-| approach | light work (parse + 32 ops) | heavy work (parse + 2048 ops) |
-|---|---:|---:|
-| sequential `bufio.Scanner` | 36 ms · 392 MB/s · 4 allocs | 1.72 s · 8.3 MB/s · 4 allocs |
-| stdlib line iterator (read-all, sequential) | 24 ms · 600 MB/s · 5 allocs | 1.72 s · 8.3 MB/s · 5 allocs |
-| goroutine pool + channel | 164 ms · 87 MB/s · 1.0M allocs | 406 ms · 35 MB/s · 1.0M allocs |
-| `Lines(f)` | 44 ms · 328 MB/s · 1.0M allocs | 182 ms · 79 MB/s · 1.0M allocs |
-| `Iter` over the stdlib iterator | 37 ms · 389 MB/s · 7.9K allocs | 187 ms · 77 MB/s · 7.9K allocs |
-| **`Chunks(f, 64 KiB)`** | **5.7 ms · 2.5 GB/s · 741 allocs** | **173 ms · 83 MB/s · 781 allocs** |
-| `Chunks(f, 256 KiB)` | 6.3 ms · 2.3 GB/s | 195 ms · 73 MB/s |
-| `Chunks(f, 1 MiB)` | 9.0 ms · 1.6 GB/s | 363 ms · 39 MB/s |
-
-- **`Chunks` wins both**: ~6× the sequential scan on light work and ~10× on heavy
-  work. It avoids the per-line allocation *and* parallelizes, and its memory is
-  bounded by the chunk size instead of the file size.
-- **The stdlib iterator is fast sequentially** (24 ms, 5 allocs) but cannot
-  parallelize on its own; fed to `Iter` it does (heavy: 1.72 s → 187 ms), at the
-  cost of reading the whole file and materializing a slice header per line.
-- **`Lines` is the convenient adapter**, but its per-line `string` caps it near
-  sequential throughput when the work per line is small.
-- **The traditional goroutine pool is the slowest parallel option**: it pays a
-  channel send per line.
-- Prefer **smaller chunks (64–256 KiB)**: more morsels means better balancing.
-  1 MiB gives only ~14 morsels for this file, so the tail dominates.
-
-## Allocations
-
-Allocation is **per run**, not per element, and the slice primitives allocate
-**nothing per morsel**.
-
-- The only per-run allocations are the queues of the workers that actually
-  spawn (lazily) and a few small structs. That is why `allocs/op` is
-  **constant** as the input grows: from 1K to 100K elements it stays at 23
-  allocations. It rises only when more workers join (1M elements → 32).
-- Per-morsel: **zero** for `ForEachSlice`, `MapSlice`, and `ReduceSlice`. The
-  morsel is a 32-byte value (`start` + a slice header) pushed through the queues
-  by value.
-- The **pipeline** pays two small closures per morsel for its `emit` chain, but
-  its intermediate element buffers are pooled per stage (`sync.Pool`), so there
-  is no per-element allocation.
-
-`go test -bench -benchmem` (1M `int`s):
-
-| call | B/op | allocs/op |
-|---|---:|---:|
-| `ForEachSlice`, 1K elements | 23 KB | 23 |
-| `ForEachSlice`, 100K elements | 23 KB | 23 |
-| `ForEachSlice`, 1M elements | 48 KB | 32 |
-| Pipeline `Map` + `Reduce`, 1M | 573 KB | 8445 |
-
-If you need the last drop of throughput on a hot path, prefer the primitives
-(`ForEachSlice`/`MapSlice`/`ReduceSlice`) over the pipeline, and reuse an
-`Executor` with `WithExecutor` so the configuration and stats stay put.
-
 ## Errors and cancellation
 
 Every operation takes a `context` (via `WithContext` or the `ctx` parameter of
@@ -654,72 +558,6 @@ also come last.
 - **Lock-free reduce**: each worker folds into its own accumulator; the partials
   are merged at the end.
 
-## Benchmarks
-
-`GOMAXPROCS=20` (i7-13700H), `go test -bench -benchtime=3s -benchmem`. Benchmarks
-are named by what they run: `BaselineLoop` is a plain `for` loop, `ChannelPool`
-is a traditional goroutine pool fed by a channel, and `Morsel*` is this library.
-
-### Heavy per-element work — the library's home turf
-
-1M `int`s, 64 iterations of work per element:
-
-| approach | ns/op | B/op | allocs/op |
-|---|---:|---:|---:|
-| `BaselineLoop` — plain `for` loop | 59.7 ms | 0 | 0 |
-| `ChannelPool` — goroutine pool + channel | 15.7 ms | 1.7 KB | 22 |
-| **`Morsel`** — this library | **7.3 ms** | 36 KB | 114 |
-
-**~8× faster than the plain loop and ~2× faster than the channel pool.**
-
-### Scaling with workers (`Morsel`, same heavy workload)
-
-| `MaxWorkers` | ns/op | B/op |
-|---:|---:|---:|
-| 1 (runs on the caller) | 55.0 ms | 152 |
-| 2 | 31.6 ms | 5.5 KB |
-| 4 | 17.4 ms | 8.8 KB |
-| 8 | 11.2 ms | 15 KB |
-| 16 | 7.8 ms | 29 KB |
-
-One worker is within ~10% of the plain loop (`BaselineLoop` 59.7 ms) — the
-sequential path adds almost nothing.
-
-### Little work
-
-A tiny **input** is free — it never touches the pool:
-
-| benchmark | ns/op | B/op | allocs/op |
-|---|---:|---:|---:|
-| `TinyInput/sequential` — 100 elements, on the caller | **344 ns** | 304 | 6 |
-| `TinyInput/pooled` — 100 elements, forced through the pool | 15.2 µs | 7.4 KB | 32 |
-
-~**44×** cheaper and ~**24×** lighter on allocation when it stays on the caller.
-
-A large input of **trivial** work is the opposite: the library still scales, but
-the per-element call overhead keeps it behind a plain loop.
-
-| benchmark | ns/op | B/op | allocs/op |
-|---|---:|---:|---:|
-| `Light/baseline` — 1M `sum += v`, plain loop | **359 µs** | 0 | 0 |
-| `Light/1` — 1M trivial, one worker | 1.34 ms | 152 | 4 |
-| `Light/16` — 1M trivial, 16 workers | 0.87 ms | 29 KB | 92 |
-
-It scales ~1.5× from 1 to 16 workers but never catches the plain loop: a
-callback-based engine cannot inline a few-ns body. Use it when the per-element
-work is real.
-
-The per-morsel cost is dominated by your own callback: the profile shows the
-engine at ~5% and the callback at ~95%. `MorselSize` and worker sweeps are in the
-suite; 256 is a reasonable default.
-
-Run it yourself:
-
-```bash
-go test -race ./...
-go test -run='^$' -bench=. -benchmem ./...
-```
-
 ## Package layout
 
 The public package is a thin facade; the machinery lives in `internal/` and is
@@ -786,6 +624,144 @@ func (p Pipeline[Src, Out]) Reduce[U any](init U, fold func(U, Out) U, merge fun
 ```
 
 Requires **Go 1.27** (generic methods).
+
+## Benchmarks
+
+`GOMAXPROCS=20` (i7-13700H), `go test -bench -benchtime=3s -benchmem`. Benchmarks
+are named by what they run: `BaselineLoop` is a plain `for` loop, `ChannelPool`
+is a traditional goroutine pool fed by a channel, and `Morsel*` is this library.
+
+Run it yourself:
+
+```bash
+go test -race ./...
+go test -run='^$' -bench=. -benchmem ./...
+```
+
+### Heavy per-element work — the library's home turf
+
+1M `int`s, 64 iterations of work per element:
+
+| approach | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| `BaselineLoop` — plain `for` loop | 54.4 ms | 0 | 0 |
+| `ChannelPool` — goroutine pool + channel | 15.2 ms | 1.5 KB | 21 |
+| **`Morsel`** — this library | **7.2 ms** | 35 KB | 93 |
+
+**~7.5× faster than the plain loop and ~2.1× faster than the channel pool.**
+
+### Scaling with workers (`Morsel`, same heavy workload)
+
+| `MaxWorkers` | ns/op | B/op | allocs/op |
+|---:|---:|---:|---:|
+| 1 (runs on the caller) | 57.3 ms | 200 | 4 |
+| 2 | 32.3 ms | 5.4 KB | 19 |
+| 4 | 17.6 ms | 8.7 KB | 27 |
+| 8 | 11.6 ms | 15 KB | 43 |
+| 16 | 7.9 ms | 28 KB | 75 |
+
+One worker is within ~10% of the plain loop (`BaselineLoop` 54.4 ms) — the
+sequential path adds almost nothing.
+
+### Small inputs cost nothing
+
+You never have to guess a "right" `MaxWorkers`. A tiny **input** never touches
+the pool: if the whole input fits in one morsel — or `MaxWorkers` is 1 — the loop
+runs on the calling goroutine, with no workers, queues or extra goroutines. The
+trigger is the input size, not `MaxWorkers`, so a small input stays inline even
+with `MaxWorkers(8)`.
+
+| benchmark | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| `TinyInput/sequential` — 100 elements, on the caller | **347 ns** | 352 | 6 |
+| `TinyInput/pooled` — 100 elements, forced through the pool | 14.5 µs | 7.3 KB | 27 |
+
+~**42×** cheaper and ~**21×** lighter on allocation when it stays on the caller.
+
+On the pooled path, workers track the backlog: the pool grows to
+`min(MaxWorkers, morsels queued)`, so a two-morsel run uses two workers, not
+eight, and only the workers that start are allocated.
+
+### Trivial work over a large input — the poor fit
+
+The library still scales, but the per-element call overhead keeps it behind a
+plain loop.
+
+| benchmark | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| `Light/baseline` — 1M `sum += v`, plain loop | **321 µs** | 0 | 0 |
+| `Light/1` — 1M trivial, one worker | 1.46 ms | 200 | 4 |
+| `Light/16` — 1M trivial, 16 workers | 0.88 ms | 28 KB | 75 |
+
+It scales ~1.7× from 1 to 16 workers but never catches the plain loop: a
+callback-based engine cannot inline a few-ns body. Use it when the per-element
+work is real.
+
+The per-morsel cost is dominated by your own callback: the profile shows the
+engine at ~5% and the callback at ~95%. `MorselSize` and worker sweeps are in the
+suite; 256 is a reasonable default.
+
+### Allocations
+
+Allocation is **per run**, not per element: the slice primitives allocate
+**nothing per morsel**. A morsel is a 32-byte value (`start` + a slice header)
+pushed through the queues by value.
+
+- The only per-run allocations are the queues, worker state and overflow buffer
+  of the workers that actually spawn — all created lazily, so a run that needs
+  two workers pays for two. The count tracks how many workers join, not how many
+  elements there are: 1K and 100K elements differ only because the larger input
+  starts more workers.
+- The **pipeline** pays two small closures per morsel for its `emit` chain, but
+  its intermediate element buffers are pooled per stage (`sync.Pool`), so there
+  is no per-element allocation.
+
+`go test -bench -benchmem` (`GOMAXPROCS=20`):
+
+| call | B/op | allocs/op |
+|---|---:|---:|
+| `ForEachSlice`, 1K elements | 7.2 KB | 23 |
+| `ForEachSlice`, 100K elements | 15 KB | 41 |
+| `ForEachSlice`, 1M elements | 15 KB | 42 |
+| Pipeline `Map` + `Reduce`, 1M | 448 KB | 8493 |
+
+If you need the last drop of throughput on a hot path, prefer the primitives
+(`ForEachSlice`/`MapSlice`/`ReduceSlice`) over the pipeline, and reuse an
+`Executor` with `WithExecutor` so the configuration and stats stay put.
+
+### Real I/O: `Lines` vs `Chunks` vs the stdlib iterator
+
+`Lines` materializes one `string` per line, so line-oriented processing pays an
+allocation **per line**. `Chunks` reads the file in blocks, and splitting lines
+inside a block allocates nothing per line. The engine also consumes a stdlib
+iterator directly, since `Iter` takes any `iter.Seq[T]`.
+
+Same 1M-line (~14 MB) file read from disk, `GOMAXPROCS=20`,
+`go test -bench -benchtime=2s`:
+
+| approach | light work (parse + 32 ops) | heavy work (parse + 2048 ops) |
+|---|---:|---:|
+| sequential `bufio.Scanner` | 33 ms · 440 MB/s · 4 allocs | 1.75 s · 8.2 MB/s · 4 allocs |
+| stdlib line iterator (read-all, sequential) | 24 ms · 593 MB/s · 5 allocs | 1.79 s · 8.0 MB/s · 5 allocs |
+| goroutine pool + channel | 168 ms · 85 MB/s · 1.0M allocs | 421 ms · 34 MB/s · 1.0M allocs |
+| `Lines(f)` | 46 ms · 310 MB/s · 1.0M allocs | 163 ms · 88 MB/s · 1.0M allocs |
+| `Iter` over the stdlib iterator | 39 ms · 364 MB/s · 7.9K allocs | 164 ms · 87 MB/s · 7.9K allocs |
+| **`Chunks(f, 64 KiB)`** | **5.9 ms · 2.4 GB/s · 721 allocs** | **170 ms · 84 MB/s · 757 allocs** |
+| `Chunks(f, 256 KiB)` | 6.5 ms · 2.2 GB/s · 222 allocs | 186 ms · 77 MB/s · 266 allocs |
+| `Chunks(f, 1 MiB)` | 9.4 ms · 1.5 GB/s · 84 allocs | 361 ms · 40 MB/s · 90 allocs |
+
+- **`Chunks` wins both**: ~5.5× the sequential scan on light work and ~10× on
+  heavy work. It avoids the per-line allocation *and* parallelizes, and its
+  memory is bounded by the chunk size instead of the file size.
+- **The stdlib iterator is fast sequentially** (24 ms, 5 allocs) but cannot
+  parallelize on its own; fed to `Iter` it does (heavy: 1.79 s → 164 ms), at the
+  cost of reading the whole file and materializing a slice header per line.
+- **`Lines` is the convenient adapter**, but its per-line `string` caps it near
+  sequential throughput when the work per line is small.
+- **The traditional goroutine pool is the slowest parallel option**: it pays a
+  channel send per line.
+- Prefer **smaller chunks (64–256 KiB)**: more morsels means better balancing.
+  1 MiB gives only ~14 morsels for this file, so the tail dominates.
 
 ## License
 
