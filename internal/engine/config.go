@@ -14,7 +14,8 @@ type Config struct {
 	// MorselSize is the number of items per morsel. Zero means 256.
 	MorselSize uint
 	// QueueCapacity bounds each worker queue and the injection queue. It is
-	// what keeps every queue bounded. Zero means 256.
+	// what keeps every queue bounded. Smaller queues fit in cache and measure
+	// faster; larger ones buffer more slack for a bursty producer. Zero means 32.
 	QueueCapacity uint
 	// StealAttempts bounds the steal loop so an idle worker never scans the
 	// pool forever. Zero means 4.
