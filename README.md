@@ -701,3 +701,7 @@ func (p Pipeline[Src, Out]) Reduce[U any](init U, fold func(U, Out) U, merge fun
 ```
 
 Requires **Go 1.27** (generic methods).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
