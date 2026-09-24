@@ -22,8 +22,10 @@ type Worker[T, S any] struct {
 	// mu/cond/ready implement the park/wake handshake. sync.Cond is markedly
 	// cheaper than a channel handoff here (Signal is ~28ns vs ~120ns), and the
 	// producer can wake exactly the worker it fed instead of an arbitrary one.
+	// cond is a value so a worker costs one allocation rather than two; L is
+	// pointed at mu when the worker starts. The Worker is never copied.
 	mu    sync.Mutex
-	cond  *sync.Cond
+	cond  sync.Cond
 	ready bool
 
 	run   *Runner[T, S]
@@ -47,7 +49,7 @@ type Runner[T, S any] struct {
 	stop   chan struct{}
 
 	mu   sync.Mutex
-	cond *sync.Cond
+	cond sync.Cond
 
 	next         atomic.Uint64
 	live         atomic.Int32
@@ -83,7 +85,7 @@ func NewRunner[T, S any](
 		stop:     make(chan struct{}),
 		workers:  make([]*Worker[T, S], cfg.MaxWorkers),
 	}
-	r.cond = sync.NewCond(&r.mu)
+	r.cond.L = &r.mu
 	return r
 }
 
@@ -109,7 +111,7 @@ func (r *Runner[T, S]) spawn() {
 		r.workers[id] = w
 	}
 	w.queue = queue.NewSPMC[Work[T]](int(r.cfg.QueueCapacity))
-	w.cond = sync.NewCond(&w.mu)
+	w.cond.L = &w.mu
 	w.State = r.newState()
 	r.live.Add(1)
 	r.wg.Add(1)
