@@ -235,7 +235,7 @@ func benchIterStdlib(b *testing.B, path string, size int64, rounds, morsel int) 
 func BenchmarkIOLight(b *testing.B) {
 	path, size := writeIOLines(b, ioLines)
 	b.Run("sequential", func(b *testing.B) { benchSeq(b, path, size, ioLight) })
-	b.Run("workerpool", func(b *testing.B) { benchPool(b, path, size, ioLight) })
+	b.Run("channel-pool", func(b *testing.B) { benchPool(b, path, size, ioLight) })
 	b.Run("lines", func(b *testing.B) { benchLines(b, path, size, ioLight, ioMorsel) })
 	b.Run("stdlib-lines", func(b *testing.B) { benchStdlibLines(b, path, size, ioLight) })
 	b.Run("iter-stdlib", func(b *testing.B) { benchIterStdlib(b, path, size, ioLight, ioMorsel) })
@@ -248,7 +248,7 @@ func BenchmarkIOLight(b *testing.B) {
 func BenchmarkIOHeavy(b *testing.B) {
 	path, size := writeIOLines(b, ioLines)
 	b.Run("sequential", func(b *testing.B) { benchSeq(b, path, size, ioHeavy) })
-	b.Run("workerpool", func(b *testing.B) { benchPool(b, path, size, ioHeavy) })
+	b.Run("channel-pool", func(b *testing.B) { benchPool(b, path, size, ioHeavy) })
 	b.Run("lines", func(b *testing.B) { benchLines(b, path, size, ioHeavy, ioMorsel) })
 	b.Run("stdlib-lines", func(b *testing.B) { benchStdlibLines(b, path, size, ioHeavy) })
 	b.Run("iter-stdlib", func(b *testing.B) { benchIterStdlib(b, path, size, ioHeavy, ioMorsel) })

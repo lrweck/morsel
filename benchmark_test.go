@@ -28,7 +28,7 @@ func benchWork(v int) int {
 }
 
 // BenchmarkSequential is the baseline single-threaded loop.
-func BenchmarkSequential(b *testing.B) {
+func BenchmarkBaselineLoop(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		sum := 0
@@ -41,7 +41,7 @@ func BenchmarkSequential(b *testing.B) {
 
 // BenchmarkWorkerPoolChannel is a traditional fixed pool fed by a channel, for
 // comparison with the morsel engine.
-func BenchmarkWorkerPoolChannel(b *testing.B) {
+func BenchmarkChannelPool(b *testing.B) {
 	const workers = 8
 	const chunk = 256
 	b.ReportAllocs()
@@ -202,6 +202,49 @@ func BenchmarkMorselIrregular(b *testing.B) {
 			func(a, c int) int { return a + c }); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkSmall is a tiny input that fits in one morsel, so it runs on the
+// caller (no pool), against the same input forced through the pool.
+func BenchmarkTinyInput(b *testing.B) {
+	data := make([]int, 100)
+	b.Run("sequential", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if err := ForEach(data, func(int) {}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("pooled", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if err := ForEach(data, func(int) {}, MorselSize(1), MaxWorkers(4)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// BenchmarkLight is a lot of trivial work: the per-morsel overhead does not
+// vanish with parallelism, so it shows whether more workers pay off at all.
+// workers=1 runs on the caller thanks to the sequential fast path.
+func BenchmarkLight(b *testing.B) {
+	for _, workers := range []int{1, 2, 4, 8, 16} {
+		b.Run(sizeName(workers), func(b *testing.B) {
+			ex := NewExecutor(Config{
+				MaxWorkers: uint(workers), MorselSize: 256, QueueCapacity: 256, StealAttempts: 4,
+			})
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := ex.ReduceSlice(context.Background(), benchData, 0,
+					func(acc, v int) int { return acc + v },
+					func(a, c int) int { return a + c }); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

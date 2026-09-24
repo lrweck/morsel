@@ -25,6 +25,7 @@ stealing**, **bounded** queues, and **zero dependencies**. Based on Leis et al.,
 - [Install](#install)
 - [Getting started](#getting-started)
 - [When to use it — and when not to](#when-to-use-it--and-when-not-to)
+- [Sizing: small inputs and few workers cost nothing](#sizing-small-inputs-and-few-workers-cost-nothing)
 - [Compared to traditional Go](#compared-to-traditional-go)
 - [Pipeline](#pipeline)
 - [Adapters (sources)](#adapters-sources)
@@ -98,27 +99,56 @@ func main() {
 
 - **CPU-bound work over many elements** — transforms, parsing, scoring,
   aggregations, validation of large batches.
-- **Irregular per-item cost.** Work stealing means a worker that finishes its
-  share early steals from a busy peer; static chunking cannot do that.
+- **Irregular or mixed per-item cost.** Work stealing balances it: a worker that
+  finishes its share early takes from a busy peer, which static chunking cannot.
 - **Bounded memory while streaming.** Large files, network streams, or query
   results are processed in morsels without materializing everything.
 - **You want cancellation and error propagation** without hand-rolling a pool.
+- **You do not want to tune it.** Small inputs run on the caller and few-morsel
+  runs use few workers, so the same call is right for one item and ten million
+  (see [Sizing](#sizing-small-inputs-and-few-workers-cost-nothing)).
 
 **Poor fit**
 
-- **Tiny work per element** (a few ns). The per-morsel orchestration costs tens
-  of nanoseconds; for trivial bodies a plain `for` loop or a channel pool is as
-  fast or faster.
-- **Very few elements** (one or two morsels). There is nothing to parallelize.
+- **Tiny work per element over a large input** (a few ns each). Parallelism
+  cannot win when each item is cheaper than the scheduling; the result is close
+  to a plain loop. The library still does not *penalize* it — a small input of
+  tiny items just runs on the caller — it simply will not speed it up.
 - **Strict global ordering of results.** `Collect`, `MapSeq`, and iterator
   `Reduce` are unordered; only `MapSlice` preserves order.
 - **I/O-bound with a fixed low concurrency.** A semaphore or `errgroup` is
-  simpler and cheaper when you only want, say, 4 concurrent requests.
-- **Per-call latency.** Each run sets up its own state (tens of microseconds).
-  Reuse an `Executor`, or use the library for the batch rather than for a single
-  request.
+  simpler when you only want, say, 4 concurrent requests.
 - **Heavily shared mutable state in the callback.** You would serialize on it
   anyway; the parallelism buys nothing.
+
+## Sizing: small inputs and few workers cost nothing
+
+You never have to guess a "right" `MaxWorkers`, and a small job never pays for a
+pool it does not need. The same call is optimal for one element and for ten
+million:
+
+- **One morsel runs on the calling goroutine.** If the input fits in a single
+  morsel — or `MaxWorkers` is 1 — there is no pool, no queue and no extra
+  goroutine; the loop runs in place. The trigger is the input size, not
+  `MaxWorkers`, so `MaxWorkers(8)` with a small input still runs inline.
+- **Workers track the backlog.** The pool grows to `min(MaxWorkers, morsels
+  queued)`, so a two-morsel run uses two workers, not eight. `MaxWorkers` is a
+  ceiling, never a target.
+- **Idle workers steal.** When a worker drains its queue it takes from a busy
+  peer, so uneven work — a few slow items — still finishes together.
+
+Measured (`go test -bench -benchtime=3s`, `GOMAXPROCS=20`):
+
+| benchmark | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| `TinyInput/sequential` — 100 elements, on the caller | **356 ns** | 304 | 6 |
+| `TinyInput/pooled` — 100 elements, forced through the pool | 27.4 µs | 56 KB | 34 |
+| `MorselWorkers/1` — 1M heavy, one worker (caller) | 62.3 ms | 152 | 4 |
+| `BaselineLoop` — 1M heavy, plain `for` loop | 55.4 ms | 0 | 0 |
+
+A tiny input is ~**77×** cheaper and ~**185×** lighter on allocation when it stays
+on the caller, and a single worker is within ~12% of a hand-written loop: when
+there is nothing to parallelize, the engine adds essentially nothing.
 
 ## Compared to traditional Go
 
@@ -618,20 +648,51 @@ also come last.
 
 ## Benchmarks
 
-1M `int`s, 64 iterations of work per element, `GOMAXPROCS=20` (i7-13700H,
-`go test -bench -benchmem`, 1s window):
+`GOMAXPROCS=20` (i7-13700H), `go test -bench -benchtime=3s -benchmem`. Benchmarks
+are named by what they run: `BaselineLoop` is a plain `for` loop, `ChannelPool`
+is a traditional goroutine pool fed by a channel, and `Morsel*` is this library.
+
+### Heavy per-element work — the library's home turf
+
+1M `int`s, 64 iterations of work per element:
 
 | approach | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| sequential loop | 58.8 ms | 0 | 0 |
-| worker pool + channel | 15.7 ms | ~2 KB | 23 |
-| **morsel (`ReduceSlice`, 20 workers)** | **8.6 ms** | ~161 KB | 88 |
+| `BaselineLoop` — plain `for` loop | 55.4 ms | 0 | 0 |
+| `ChannelPool` — goroutine pool + channel | 15.7 ms | 1.6 KB | 21 |
+| **`Morsel`** — this library | **8.6 ms** | 235 KB | 115 |
 
-- ~**1.8×** faster than the channel pool and ~**6.8×** faster than sequential.
-- The per-morsel cost is dominated by your own callback: the profile shows the
-  engine at ~5% and the callback at ~95%.
-- `MorselSize` and worker-count sweeps are in the benchmark suite; 256 is a
-  reasonable default, and the pool scales until it runs out of cores.
+**~6.4× faster than the plain loop and ~1.8× faster than the channel pool.**
+
+### Scaling with workers (`Morsel`, same heavy workload)
+
+| `MaxWorkers` | ns/op |
+|---:|---:|
+| 1 (runs on the caller) | 62.3 ms |
+| 2 | 33.5 ms |
+| 4 | 18.4 ms |
+| 8 | 11.5 ms |
+| 16 | 9.7 ms |
+
+One worker is within ~12% of the plain loop (`BaselineLoop` 55.4 ms) — the
+sequential path adds almost nothing.
+
+### Little work — no penalty
+
+| case | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| `TinyInput/sequential` — 100 elements, on the caller | **356 ns** | 304 | 6 |
+| `TinyInput/pooled` — 100 elements, forced through the pool | 27.4 µs | 56 KB | 34 |
+| `Light/1` — 1M trivial items, 1 worker | 1.46 ms | 152 | 4 |
+| `Light/16` — 1M trivial items, 16 workers | 0.87 ms | 190 KB | 92 |
+
+A tiny input is ~**77×** cheaper and ~**185×** lighter on allocation when it stays
+on the caller, and even trivial 1M-item work still scales ~1.7× from 1 to 16
+workers.
+
+The per-morsel cost is dominated by your own callback: the profile shows the
+engine at ~5% and the callback at ~95%. `MorselSize` and worker sweeps are in the
+suite; 256 is a reasonable default.
 
 Run it yourself:
 
