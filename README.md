@@ -374,6 +374,7 @@ Available stages: `Map`, `MapE` (fallible), `Filter`, `FlatMap`.
 | `Iter(seq)` | `Pipeline[T, T]` from an `iter.Seq[T]` |
 | `IterErr(seq2)` | same, for `iter.Seq2[T, error]` |
 | `Chunks(r, size)` | `Pipeline[[]byte, []byte]`, one chunk per `Read` |
+| `ChunksPooled(r, size)` | same, but the chunk buffers are recycled |
 | `Lines(r)` | `Pipeline[string, string]` |
 | `Rows(next)` | `Pipeline[T, T]` from a pull iterator (`sql.Rows`, `csv`) |
 | `From(src)` | `Pipeline[T, T]` from a custom `Source[T]` |
@@ -384,6 +385,9 @@ morsel.Range(0, 1_000_000).ForEach(func(i int) { work(i) })
 
 // Chunks of an io.Reader
 morsel.Chunks(r, 64<<10).ForEach(func(b []byte) { hash.Write(b) })
+
+// Same, recycling the chunk buffers: the callback must not keep b.
+morsel.ChunksPooled(r, 64<<10).ForEach(func(b []byte) { hash.Write(b) })
 
 // Rows (e.g. database/sql)
 rows, _ := db.Query("select id, amount from debts")
@@ -431,7 +435,7 @@ Resource sketch at defaults (`MaxWorkers=GOMAXPROCS`, `MorselSize=256`,
 | Resource | Cost |
 |---|---|
 | Worker goroutines | ≤ `MaxWorkers` (+1 watcher while running) |
-| Queue memory | `MaxWorkers × QueueCapacity × 40 B` ≈ 1.3 KB/worker, plus the overflow queue only when used |
+| Queue memory | `MaxWorkers × QueueCapacity × 48 B` ≈ 1.5 KB/worker, plus the overflow queue only when used |
 | In-flight elements | ≤ `MorselSize × sizeof(T)` per queued morsel |
 | Allocations per morsel (primitives) | **0** |
 | CPU when idle | ~0 (parked) |
@@ -544,7 +548,8 @@ also come last.
    execute        execute         execute
 ```
 
-- **Morsel**: `Work[T]{Start, Items}` — 32 bytes; the slice path stores
+- **Morsel**: `Work[T]{Start, Items, Release}` — 40 bytes (`Release` stays nil
+  for most sources); the slice path stores
   `data[start:end]` (a zero-copy sub-slice, no allocation).
 - **Per-worker queue → SPMC** (single-producer/multi-consumer) with per-cell
   sequence numbers (Vyukov): a single producer, consumers are the owner plus
@@ -621,6 +626,7 @@ func Range(start, end int) Pipeline[int, int]
 func Iter[T any](seq iter.Seq[T]) Pipeline[T, T]
 func IterErr[T any](seq iter.Seq2[T, error]) Pipeline[T, T]
 func Chunks(r io.Reader, size int) Pipeline[[]byte, []byte]
+func ChunksPooled(r io.Reader, size int) Pipeline[[]byte, []byte]
 func Lines(r io.Reader) Pipeline[string, string]
 func Rows[T any](next func() (T, bool, error)) Pipeline[T, T]
 func From[T any](src Source[T]) Pipeline[T, T]
@@ -640,12 +646,20 @@ func (p Pipeline[Src, Out]) Reduce[U any](init U, fold func(U, Out) U, merge fun
 ```go
 // A materialized morsel. Iterators have no random access, so their elements
 // arrive in Batches.
-type Batch[T any] struct{ Items []T }
+type Batch[T any] struct {
+	Items   []T
+	Release func() // optional; see ChunksPooled
+}
 
 // Source yields Batches to a single producer; returning an error aborts the
 // run.
 type Source[T any] func(yield func(Batch[T]) bool) error
 ```
+
+Set `Batch.Release` when a source recycles element buffers: the engine calls it
+once, after the batch's elements have been processed, so a custom source can pool
+them the way `ChunksPooled` does. The elements are only valid until `Release`
+runs.
 
 `Config` is described in [Options](#options) and `Stats` in
 [Reusable executor and stats](#reusable-executor-and-stats).
@@ -731,8 +745,8 @@ suite; 256 is a reasonable default.
 ### Allocations
 
 Allocation is **per run**, not per element: the slice primitives allocate
-**nothing per morsel**. A morsel is a 32-byte value (`start` + a slice header)
-pushed through the queues by value.
+**nothing per morsel**. A morsel is a 40-byte value (`start` + a slice header plus
+an optional release hook) pushed through the queues by value.
 
 - The only per-run allocations are the queues, worker state and overflow buffer
   of the workers that actually spawn — all created lazily, so a run that needs
@@ -760,10 +774,48 @@ If you need the last drop of throughput on a hot path, prefer the primitives
 
 `Lines` materializes one `string` per line, so line-oriented processing pays an
 allocation **per line**. `Chunks` reads the file in blocks, and splitting lines
-inside a block allocates nothing per line. The engine also consumes a stdlib
-iterator directly, since `Iter` takes any `iter.Seq[T]`.
+inside a block allocates nothing per line. `ChunksPooled` is `Chunks` with the
+chunk buffers recycled. The engine also consumes a stdlib iterator directly,
+since `Iter` takes any `iter.Seq[T]`.
 
-Same 1M-line (~14 MB) file read from disk, `GOMAXPROCS=20`,
+#### At scale the disk is the bottleneck
+
+One 5 GiB file, a single timed read per measurement, with the page cache dropped
+between runs (`dd iflag=nocache`) so a cold disk read can be compared with a warm
+one, `GOMAXPROCS=20`:
+
+| approach | cold (disk) | warm (RAM) | gain | B/op | allocs/op |
+|---|---:|---:|---:|---:|---:|
+| `dd` — raw read, the ceiling | 6.0 s · 893 MB/s | 0.52 s · 10.3 GB/s | 11.5× | — | — |
+| sequential `bufio.Scanner` | 10.4 s · 516 MB/s | 8.6 s · 626 MB/s | 1.2× | 4.2 KB | 4 |
+| `Lines(f)` | 17.0 s · 315 MB/s | 15.9 s · 339 MB/s | 1.1× | 11.8 GB | 279 M |
+| `Chunks(f, 64 KiB)` | 6.3 s · 853 MB/s | 1.6 s · 3306 MB/s | 3.9× | 5.37 GB | 246 K |
+| `Chunks(f, 256 KiB)` | 6.3 s · 850 MB/s | 1.5 s · 3550 MB/s | 4.2× | 5.37 GB | 62 K |
+| **`ChunksPooled(f, 64 KiB)`** | **6.1 s · 875 MB/s** | **0.96 s · 5582 MB/s** | **6.4×** | 4–32 MB | 83 K |
+| **`ChunksPooled(f, 256 KiB)`** | **6.1 s · 879 MB/s** | **0.96 s · 5604 MB/s** | **6.4×** | 4–42 MB | 21 K |
+
+- **Cold, `Chunks` reads the disk and stops there**: ~850–880 MB/s against the
+  ~890 MB/s `dd` ceiling. At scale the wall clock is the device, not the CPU.
+- **Sequential and `Lines` barely move** (1.1–1.2×): the disk was never their
+  limit — they are CPU- and GC-bound, and 5–8× slower than `Chunks`.
+- **Warm, `Chunks` reaches 3.3–3.6 GB/s and `ChunksPooled` 5.6 GB/s** — parallel
+  CPU over RAM. The 5 GiB that `Chunks` copies and reallocates is real work once
+  the disk is out of the way.
+- The small-file table below runs entirely from the page cache, so read it as an
+  engine comparison, not as streaming throughput.
+
+#### `Chunks` vs `ChunksPooled`: ownership, not throughput
+
+`Chunks` gives every chunk a fresh, owned `[]byte`, so a 5 GiB file allocates
+5.37 GB in total. `ChunksPooled` recycles buffers and hands the callback a slice
+that is only valid until it returns, so its total allocation tracks the chunks in
+flight (at most `MaxWorkers × QueueCapacity`) instead of the file. Both saturate
+the disk when cold; the difference is the footprint, plus ~50% on light work when
+the disk is *not* the limit (3950 vs 2640 MB/s on the 14 MB file).
+
+#### Warm cache, 14 MB file
+
+Same 1M-line (~14 MB) file the other benchmarks generate, `GOMAXPROCS=20`,
 `go test -bench -benchtime=2s`:
 
 | approach | light work (parse + 32 ops) | heavy work (parse + 2048 ops) |
@@ -773,13 +825,16 @@ Same 1M-line (~14 MB) file read from disk, `GOMAXPROCS=20`,
 | goroutine pool + channel | 168 ms · 85 MB/s · 1.0M allocs | 421 ms · 34 MB/s · 1.0M allocs |
 | `Lines(f)` | 46 ms · 310 MB/s · 1.0M allocs | 163 ms · 88 MB/s · 1.0M allocs |
 | `Iter` over the stdlib iterator | 39 ms · 364 MB/s · 7.9K allocs | 164 ms · 87 MB/s · 7.9K allocs |
-| **`Chunks(f, 64 KiB)`** | **5.9 ms · 2.4 GB/s · 721 allocs** | **170 ms · 84 MB/s · 757 allocs** |
-| `Chunks(f, 256 KiB)` | 6.5 ms · 2.2 GB/s · 222 allocs | 186 ms · 77 MB/s · 266 allocs |
-| `Chunks(f, 1 MiB)` | 9.4 ms · 1.5 GB/s · 84 allocs | 361 ms · 40 MB/s · 90 allocs |
+| `Chunks(f, 64 KiB)` | 5.4 ms · 2.6 GB/s · 721 allocs | 167 ms · 86 MB/s · 758 allocs |
+| **`ChunksPooled(f, 64 KiB)`** | **3.6 ms · 4.0 GB/s · 558 allocs** | 168 ms · 85 MB/s · 1.0K allocs |
+| `Chunks(f, 256 KiB)` | 5.9 ms · 2.4 GB/s · 223 allocs | 191 ms · 75 MB/s · 266 allocs |
+| `Chunks(f, 1 MiB)` | 8.5 ms · 1.7 GB/s · 84 allocs | 375 ms · 38 MB/s · 91 allocs |
 
-- **`Chunks` wins both**: ~5.5× the sequential scan on light work and ~10× on
-  heavy work. It avoids the per-line allocation *and* parallelizes, and its
-  memory is bounded by the chunk size instead of the file size.
+- **`Chunks` wins both**: ~5–6× the sequential scan on light work and ~9× on
+  heavy work. It avoids the per-line allocation *and* parallelizes.
+- **`ChunksPooled` helps only when the callback is the cheap part**: +50% on
+  light work, and nothing on heavy work — there the CPU is the limit, and the
+  producer runs ahead until the in-flight window holds the whole file.
 - **The stdlib iterator is fast sequentially** (24 ms, 5 allocs) but cannot
   parallelize on its own; fed to `Iter` it does (heavy: 1.79 s → 164 ms), at the
   cost of reading the whole file and materializing a slice header per line.

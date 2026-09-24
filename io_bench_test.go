@@ -189,6 +189,33 @@ func benchChunks(b *testing.B, path string, size int64, rounds, chunkSize int) {
 	}
 }
 
+// benchChunksPooled reads the file through the recycling ChunksPooled adapter.
+// The callback consumes each chunk, which is what makes recycling safe.
+func benchChunksPooled(b *testing.B, path string, size int64, rounds, chunkSize int) {
+	b.SetBytes(size)
+	b.ReportAllocs()
+	ex := NewExecutor(Config{MorselSize: 1})
+	for b.Loop() {
+		file, err := os.Open(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		var sum atomic.Int64
+		err = ChunksPooled(file, chunkSize).ForEach(func(chunk []byte) {
+			var local int64
+			for line := range bytes.Lines(chunk) {
+				local += processLineBytes(line, rounds)
+			}
+			sum.Add(local)
+		}, WithExecutor(ex))
+		file.Close()
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = sum.Load()
+	}
+}
+
 // benchStdlibLines is the stdlib-only iterator path: read the whole file, then
 // range over bytes.Lines (Go 1.24+). Sequential, but no per-line allocation.
 func benchStdlibLines(b *testing.B, path string, size int64, rounds int) {
@@ -242,6 +269,8 @@ func BenchmarkIOLight(b *testing.B) {
 	b.Run("chunks/64KiB", func(b *testing.B) { benchChunks(b, path, size, ioLight, 64<<10) })
 	b.Run("chunks/256KiB", func(b *testing.B) { benchChunks(b, path, size, ioLight, 256<<10) })
 	b.Run("chunks/1MiB", func(b *testing.B) { benchChunks(b, path, size, ioLight, 1<<20) })
+	b.Run("chunkspooled/64KiB", func(b *testing.B) { benchChunksPooled(b, path, size, ioLight, 64<<10) })
+	b.Run("chunkspooled/256KiB", func(b *testing.B) { benchChunksPooled(b, path, size, ioLight, 256<<10) })
 }
 
 // BenchmarkIOHeavy: expensive per-line work, so parallelism pays off.
@@ -255,6 +284,8 @@ func BenchmarkIOHeavy(b *testing.B) {
 	b.Run("chunks/64KiB", func(b *testing.B) { benchChunks(b, path, size, ioHeavy, 64<<10) })
 	b.Run("chunks/256KiB", func(b *testing.B) { benchChunks(b, path, size, ioHeavy, 256<<10) })
 	b.Run("chunks/1MiB", func(b *testing.B) { benchChunks(b, path, size, ioHeavy, 1<<20) })
+	b.Run("chunkspooled/64KiB", func(b *testing.B) { benchChunksPooled(b, path, size, ioHeavy, 64<<10) })
+	b.Run("chunkspooled/256KiB", func(b *testing.B) { benchChunksPooled(b, path, size, ioHeavy, 256<<10) })
 }
 
 // BenchmarkIOLinesMorselSizes shows the effect of the batch size on the light

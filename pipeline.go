@@ -83,7 +83,11 @@ func (p Pipeline[Src, Out]) runSequential[S any](
 			return false
 		}
 		morsels++
-		if err := process(w, m); err != nil {
+		err := process(w, m)
+		if m.Release != nil {
+			m.Release()
+		}
+		if err != nil {
 			runErr = err
 			return false
 		}
@@ -186,17 +190,34 @@ func From[T any](src Source[T]) Pipeline[T, T] {
 			}
 			return src(func(m Batch[T]) bool {
 				if ctx.Err() != nil {
+					releaseBatch(m)
 					return false
 				}
-				return feed(engine.Work[T]{Items: m.Items})
+				if !feed(engine.Work[T]{Items: m.Items, Release: m.Release}) {
+					// Not taken: the engine will never see it, so release here.
+					releaseBatch(m)
+					return false
+				}
+				return true
 			})
 		},
 		apply: identity[T],
 	}
 }
 
+// releaseBatch runs a batch's release hook, if it has one.
+func releaseBatch[T any](m Batch[T]) {
+	if m.Release != nil {
+		m.Release()
+	}
+}
+
 // Chunks reads r and emits one []byte per Read, so a morsel carries a single
 // chunk. size defaults to 64 KiB.
+//
+// Every chunk is a fresh, owned slice, so the reader allocates O(reader size)
+// in total and the caller may keep the bytes. Use ChunksPooled when the callback
+// consumes the chunk and total allocation matters.
 func Chunks(r io.Reader, size int) Pipeline[[]byte, []byte] {
 	if size <= 0 {
 		size = 64 << 10
@@ -223,6 +244,67 @@ func Chunks(r io.Reader, size int) Pipeline[[]byte, []byte] {
 			}
 		}
 	})
+}
+
+// chunkBuf is one recycled chunk buffer. It carries its own release func and a
+// one-element Items slice, both built once when the buffer is created, so
+// handing a chunk to the engine and taking it back allocates nothing per chunk.
+type chunkBuf struct {
+	buf     []byte
+	items   [1][]byte
+	release func()
+}
+
+// ChunksPooled is Chunks for a callback that consumes the chunk rather than
+// keeping it. It recycles buffers, so total allocation is bounded by the chunks
+// in flight instead of by the size of the reader:
+//
+//	ChunksPooled(file, 64<<10).ForEach(func(b []byte) { hash.Write(b) })
+//
+// The chunk is only valid until the callback returns; copy it to keep it. Pair
+// it with a smaller QueueCapacity if the in-flight window still holds too much.
+func ChunksPooled(r io.Reader, size int) Pipeline[[]byte, []byte] {
+	if size <= 0 {
+		size = 64 << 10
+	}
+	return Pipeline[[]byte, []byte]{
+		size: -1,
+		feed: func(_ *Executor, ctx context.Context, feed func(engine.Work[[]byte]) bool) error {
+			if r == nil {
+				return ErrNilSource
+			}
+			// One buffer per chunk in flight: the engine releases each one as
+			// soon as its morsel is done, and a released buffer is reused for a
+			// later Read.
+			pool := &sync.Pool{}
+			pool.New = func() any {
+				cb := &chunkBuf{buf: make([]byte, size)}
+				cb.release = func() { pool.Put(cb) }
+				return cb
+			}
+			for {
+				cb := pool.Get().(*chunkBuf)
+				n, err := r.Read(cb.buf)
+				if n > 0 {
+					cb.items[0] = cb.buf[:n]
+					m := engine.Work[[]byte]{Items: cb.items[:], Release: cb.release}
+					if !feed(m) {
+						pool.Put(cb)
+						return nil
+					}
+				} else {
+					pool.Put(cb)
+				}
+				if err != nil {
+					if errors.Is(err, io.EOF) {
+						return nil
+					}
+					return err
+				}
+			}
+		},
+		apply: identity[[]byte],
+	}
 }
 
 // Lines reads r line by line, batched by MorselSize.

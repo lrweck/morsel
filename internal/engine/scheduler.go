@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"reflect"
 	"sync"
 	"sync/atomic"
 
@@ -57,7 +58,7 @@ type Runner[T, S any] struct {
 	producerDone atomic.Bool
 	created      atomic.Uint64
 	pending      atomic.Int64
-	stopOnce     sync.Once
+	stopClosed   atomic.Bool
 	err          error
 
 	wg sync.WaitGroup
@@ -108,10 +109,14 @@ func (r *Runner[T, S]) spawn() {
 		// The worker itself is allocated here too, so a run pays for the
 		// workers it actually starts rather than for MaxWorkers of them.
 		w = &Worker[T, S]{id: id, run: r, rng: uint64(id+1) * 0x9E3779B97F4A7C15}
+		w.cond.L = &w.mu
 		r.workers[id] = w
 	}
-	w.queue = queue.NewSPMC[Work[T]](int(r.cfg.QueueCapacity))
-	w.cond.L = &w.mu
+	// A pooled runner keeps its queue across runs; only a fresh worker needs
+	// one.
+	if w.queue == nil {
+		w.queue = queue.NewSPMC[Work[T]](int(r.cfg.QueueCapacity))
+	}
 	w.State = r.newState()
 	r.live.Add(1)
 	r.wg.Add(1)
@@ -205,7 +210,9 @@ func (r *Runner[T, S]) notify(w *Worker[T, S]) {
 
 // wakeAll releases every parked worker. It is called once, when the run stops.
 func (r *Runner[T, S]) wakeAll() {
-	r.stopOnce.Do(func() { close(r.stop) })
+	if r.stopClosed.CompareAndSwap(false, true) {
+		close(r.stop)
+	}
 	for _, w := range r.workers[:int(r.live.Load())] {
 		w.mu.Lock()
 		w.cond.Broadcast()
@@ -305,6 +312,11 @@ func invoke[T, S any](
 	w *Worker[T, S],
 	m Work[T],
 ) (err error) {
+	// The release runs however process ends, including a recovered panic, so a
+	// recycled buffer is never lost.
+	if m.Release != nil {
+		defer m.Release()
+	}
 	if !cfg.RecoverPanics {
 		return process(w, m)
 	}
@@ -376,12 +388,16 @@ func (r *Runner[T, S]) Wait() (Stats, error) {
 	}
 
 	// The watcher wakes Wait when an external context is cancelled, because
-	// sync.Cond cannot be selected on. Its lifetime is bounded by the run.
+	// sync.Cond cannot be selected on. Wait joins it before returning, so a
+	// stale watcher can never touch a pooled Runner that has been re-armed.
+	ctx := r.ctx
 	watchStop := make(chan struct{})
+	watchDone := make(chan struct{})
 	go func() {
+		defer close(watchDone)
 		select {
-		case <-r.ctx.Done():
-			r.fail(r.ctx.Err())
+		case <-ctx.Done():
+			r.fail(ctx.Err())
 		case <-watchStop:
 		}
 	}()
@@ -396,6 +412,7 @@ func (r *Runner[T, S]) Wait() (Stats, error) {
 	r.wakeAll()
 	r.wg.Wait()
 	close(watchStop)
+	<-watchDone
 
 	r.mu.Lock()
 	err := r.err
@@ -431,6 +448,112 @@ func xorshift(x uint64) uint64 {
 	return x
 }
 
+// runnerPools hands a finished Runner back for the next run of the same shape,
+// so the queues, worker structs and channels are allocated once rather than per
+// run. The key includes the element types and the two fields that fix the
+// allocation — QueueCapacity and MaxWorkers — so a reused runner always matches
+// the run taking it, and an Executor's configuration is never silently ignored.
+var runnerPools sync.Map // runnerKey -> *sync.Pool
+
+type runnerKey struct {
+	typ      reflect.Type
+	queueCap uint
+	workers  uint
+}
+
+func runnerPool[T, S any](cfg Config) *sync.Pool {
+	key := runnerKey{
+		typ:      reflect.TypeFor[*Runner[T, S]](),
+		queueCap: cfg.QueueCapacity,
+		workers:  cfg.MaxWorkers,
+	}
+	p, _ := runnerPools.LoadOrStore(key, &sync.Pool{})
+	return p.(*sync.Pool)
+}
+
+// acquireRunner reuses a pooled Runner when one is available, otherwise builds
+// a fresh one.
+func acquireRunner[T, S any](
+	cfg Config,
+	ctx context.Context,
+	process func(w *Worker[T, S], m Work[T]) error,
+	newState func() S,
+) *Runner[T, S] {
+	if v := runnerPool[T, S](cfg).Get(); v != nil {
+		r := v.(*Runner[T, S])
+		r.reset(cfg, ctx, process, newState)
+		return r
+	}
+	return NewRunner(cfg, ctx, process, newState)
+}
+
+// releaseRunner returns a clean Runner to its pool. It is called only for a run
+// that finished without error, so every published morsel was consumed and the
+// queues are empty and reusable as-is.
+func releaseRunner[T, S any](r *Runner[T, S]) {
+	// A pooled runner must not keep the finished run's data alive.
+	r.process = nil
+	r.newState = nil
+	r.ctx = nil
+	var zero S
+	for _, w := range r.workers {
+		if w != nil {
+			w.State = zero
+			w.stats = WorkerStats{}
+		}
+	}
+	runnerPool[T, S](r.cfg).Put(r)
+}
+
+// reset re-arms a pooled Runner for a new run. The previous run must have
+// finished cleanly: no worker is alive, every morsel was consumed, and all
+// queues are empty.
+func (r *Runner[T, S]) reset(
+	cfg Config,
+	ctx context.Context,
+	process func(w *Worker[T, S], m Work[T]) error,
+	newState func() S,
+) {
+	assert(r.stopped.Load(), "reset expects a stopped runner")
+	assert(r.pending.Load() == 0, "reset expects an empty backlog")
+	assert(len(r.workers) == int(cfg.MaxWorkers), "pooled runner shape must match its key")
+
+	r.cfg = cfg
+	r.ctx = ctx
+	r.process = process
+	r.newState = newState
+
+	r.next.Store(0)
+	r.created.Store(0)
+	r.producerDone.Store(false)
+	r.stopped.Store(false)
+	r.live.Store(0)
+
+	r.mu.Lock()
+	r.err = nil
+	r.mu.Unlock()
+
+	// The stop channel was closed at teardown, so the run needs a fresh one.
+	r.stopClosed.Store(false)
+	r.stop = make(chan struct{})
+
+	// Drop a wake token a blocked producer may have left behind.
+drain:
+	for {
+		select {
+		case <-r.space:
+		default:
+			break drain
+		}
+	}
+
+	for _, w := range r.workers {
+		if w != nil {
+			w.ready = false
+		}
+	}
+}
+
 // RunSlice is the slice path: it morselizes data by index without copying, then
 // runs process on each morsel.
 //
@@ -449,7 +572,7 @@ func RunSlice[T, S any](
 	if int(cfg.MaxWorkers) <= 1 || len(data) <= int(cfg.MorselSize) {
 		return runSequentialSlice(ctx, cfg, data, process, newState, merge)
 	}
-	r := NewRunner(cfg, ctx, process, newState)
+	r := acquireRunner(cfg, ctx, process, newState)
 	size := int(cfg.MorselSize)
 	for start := 0; start < len(data); start += size {
 		end := min(start+size, len(data))
@@ -459,7 +582,11 @@ func RunSlice[T, S any](
 	}
 	r.Done()
 	stats, err := r.Wait()
-	return r.Merge(merge), stats, err
+	merged := r.Merge(merge)
+	if err == nil {
+		releaseRunner(r)
+	}
+	return merged, stats, err
 }
 
 // runSequentialSlice runs the morsels in order on the calling goroutine.
@@ -507,7 +634,7 @@ func RunIter[T, S any](
 	if int(cfg.MaxWorkers) <= 1 {
 		return runSequentialIter(ctx, cfg, seq, process, newState, merge)
 	}
-	r := NewRunner(cfg, ctx, process, newState)
+	r := acquireRunner(cfg, ctx, process, newState)
 	size := int(cfg.MorselSize)
 	buf := make([]T, 0, size)
 	aborted := false
@@ -529,7 +656,11 @@ func RunIter[T, S any](
 	}
 	r.Done()
 	stats, err := r.Wait()
-	return r.Merge(merge), stats, err
+	merged := r.Merge(merge)
+	if err == nil {
+		releaseRunner(r)
+	}
+	return merged, stats, err
 }
 
 // runSequentialIter runs the iterator in order on the calling goroutine.
