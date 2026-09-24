@@ -75,7 +75,7 @@ func BenchmarkChannelPool(b *testing.B) {
 // BenchmarkMorsel is the morsel engine doing the same reduction.
 func BenchmarkMorsel(b *testing.B) {
 	ex := NewExecutor(Config{
-		MaxWorkers: uint(runtime.GOMAXPROCS(0)), MorselSize: 256, QueueCapacity: 256, StealAttempts: 4,
+		MaxWorkers: uint(runtime.GOMAXPROCS(0)), MorselSize: 256, StealAttempts: 4,
 	})
 	b.ReportAllocs()
 	for b.Loop() {
@@ -94,7 +94,7 @@ func BenchmarkMorsel(b *testing.B) {
 // is the per-run worker queues only, and the morsel path is pure CPU.
 func BenchmarkForEachSliceAllocs(b *testing.B) {
 	ex := NewExecutor(Config{
-		MaxWorkers: 8, MorselSize: 256, QueueCapacity: 256, StealAttempts: 4,
+		MaxWorkers: 8, MorselSize: 256, StealAttempts: 4,
 	})
 	for _, size := range []int{1_000, 100_000, 1_000_000} {
 		data := make([]int, size)
@@ -116,7 +116,7 @@ func BenchmarkForEachSliceAllocs(b *testing.B) {
 // primitives (ForEachSlice/MapSlice/ReduceSlice) are the allocation-free path.
 func BenchmarkPipelineMapReduce(b *testing.B) {
 	ex := NewExecutor(Config{
-		MaxWorkers: uint(runtime.GOMAXPROCS(0)), MorselSize: 256, QueueCapacity: 256, StealAttempts: 4,
+		MaxWorkers: uint(runtime.GOMAXPROCS(0)), MorselSize: 256, StealAttempts: 4,
 	})
 	b.ReportAllocs()
 	for b.Loop() {
@@ -152,7 +152,7 @@ func BenchmarkMorselSizes(b *testing.B) {
 	for _, size := range []int{32, 64, 128, 256, 512, 1024, 4096} {
 		b.Run(sizeName(size), func(b *testing.B) {
 			ex := NewExecutor(Config{
-				MaxWorkers: uint(runtime.GOMAXPROCS(0)), MorselSize: uint(size), QueueCapacity: 256, StealAttempts: 4,
+				MaxWorkers: uint(runtime.GOMAXPROCS(0)), MorselSize: uint(size), StealAttempts: 4,
 			})
 			b.ReportAllocs()
 			for b.Loop() {
@@ -170,7 +170,7 @@ func BenchmarkMorselWorkers(b *testing.B) {
 	for _, workers := range []int{1, 2, 4, 8, 16} {
 		b.Run(sizeName(workers), func(b *testing.B) {
 			ex := NewExecutor(Config{
-				MaxWorkers: uint(workers), MorselSize: 256, QueueCapacity: 256, StealAttempts: 4,
+				MaxWorkers: uint(workers), MorselSize: 256, StealAttempts: 4,
 			})
 			b.ReportAllocs()
 			for b.Loop() {
@@ -188,7 +188,7 @@ func BenchmarkMorselWorkers(b *testing.B) {
 // work stealing has something to balance.
 func BenchmarkMorselIrregular(b *testing.B) {
 	ex := NewExecutor(Config{
-		MaxWorkers: uint(runtime.GOMAXPROCS(0)), MorselSize: 64, QueueCapacity: 256, StealAttempts: 8,
+		MaxWorkers: uint(runtime.GOMAXPROCS(0)), MorselSize: 64, StealAttempts: 8,
 	})
 	b.ReportAllocs()
 	for b.Loop() {
@@ -244,7 +244,7 @@ func BenchmarkLight(b *testing.B) {
 	for _, workers := range []int{1, 2, 4, 8, 16} {
 		b.Run(sizeName(workers), func(b *testing.B) {
 			ex := NewExecutor(Config{
-				MaxWorkers: uint(workers), MorselSize: 256, QueueCapacity: 256, StealAttempts: 4,
+				MaxWorkers: uint(workers), MorselSize: 256, StealAttempts: 4,
 			})
 			b.ReportAllocs()
 			for b.Loop() {

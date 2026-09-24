@@ -29,7 +29,7 @@ func DefaultConfig() Config {
 	return Config{
 		MaxWorkers:    uint(runtime.GOMAXPROCS(0)),
 		MorselSize:    256,
-		QueueCapacity: 256,
+		QueueCapacity: 32,
 		StealAttempts: 4,
 	}
 }
@@ -43,7 +43,7 @@ func (c Config) Normalize() Config {
 		c.MorselSize = 256
 	}
 	if c.QueueCapacity == 0 {
-		c.QueueCapacity = 256
+		c.QueueCapacity = 32
 	}
 	if c.StealAttempts == 0 {
 		c.StealAttempts = 4
