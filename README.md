@@ -110,16 +110,22 @@ func main() {
 
 **Poor fit**
 
-- **Tiny work per element over a large input** (a few ns each). Parallelism
-  cannot win when each item is cheaper than the scheduling; the result is close
-  to a plain loop. The library still does not *penalize* it — a small input of
-  tiny items just runs on the caller — it simply will not speed it up.
+- **Trivial work per element over a large input.** The library calls your
+  callback once per element, so when an element costs a few ns the call overhead
+  dominates: a plain `for` loop is ~2.5–4× faster (1M `sum += v`: 351 µs vs
+  862 µs at 16 workers). More workers narrow the gap but cannot close it. Small
+  inputs are unaffected — they run on the caller.
 - **Strict global ordering of results.** `Collect`, `MapSeq`, and iterator
   `Reduce` are unordered; only `MapSlice` preserves order.
-- **I/O-bound with a fixed low concurrency.** A semaphore or `errgroup` is
-  simpler when you only want, say, 4 concurrent requests.
-- **Heavily shared mutable state in the callback.** You would serialize on it
-  anyway; the parallelism buys nothing.
+- **A callback that must mutate shared state.** Independent work is what pays; a
+  shared lock serializes the run.
+
+**Fine, but maybe overkill**
+
+- **A handful of concurrent I/O requests.** `errgroup` with `SetLimit` is a
+  smaller tool, and just as valid. The library also does it — `MaxWorkers(n)`
+  bounds the concurrency — and pulls ahead once there is CPU work or a stream
+  (files, rows) to process.
 
 ## Sizing: small inputs and few workers cost nothing
 
@@ -677,18 +683,29 @@ is a traditional goroutine pool fed by a channel, and `Morsel*` is this library.
 One worker is within ~12% of the plain loop (`BaselineLoop` 55.4 ms) — the
 sequential path adds almost nothing.
 
-### Little work — no penalty
+### Little work
 
-| case | ns/op | B/op | allocs/op |
+A tiny **input** is free — it never touches the pool:
+
+| benchmark | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
 | `TinyInput/sequential` — 100 elements, on the caller | **356 ns** | 304 | 6 |
 | `TinyInput/pooled` — 100 elements, forced through the pool | 27.4 µs | 56 KB | 34 |
-| `Light/1` — 1M trivial items, 1 worker | 1.46 ms | 152 | 4 |
-| `Light/16` — 1M trivial items, 16 workers | 0.87 ms | 190 KB | 92 |
 
-A tiny input is ~**77×** cheaper and ~**185×** lighter on allocation when it stays
-on the caller, and even trivial 1M-item work still scales ~1.7× from 1 to 16
-workers.
+~**77×** cheaper and ~**185×** lighter on allocation when it stays on the caller.
+
+A large input of **trivial** work is the opposite: the library still scales, but
+the per-element call overhead keeps it behind a plain loop.
+
+| benchmark | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| `Light/baseline` — 1M `sum += v`, plain loop | **351 µs** | 0 | 0 |
+| `Light/1` — 1M trivial, one worker | 1.42 ms | 152 | 4 |
+| `Light/16` — 1M trivial, 16 workers | 0.86 ms | 190 KB | 92 |
+
+It scales ~1.7× from 1 to 16 workers but never catches the plain loop: a
+callback-based engine cannot inline a few-ns body. Use it when the per-element
+work is real.
 
 The per-morsel cost is dominated by your own callback: the profile shows the
 engine at ~5% and the callback at ~95%. `MorselSize` and worker sweeps are in the

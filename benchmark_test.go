@@ -231,6 +231,16 @@ func BenchmarkTinyInput(b *testing.B) {
 // vanish with parallelism, so it shows whether more workers pay off at all.
 // workers=1 runs on the caller thanks to the sequential fast path.
 func BenchmarkLight(b *testing.B) {
+	b.Run("baseline", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			sum := 0
+			for _, v := range benchData {
+				sum += v
+			}
+			_ = sum
+		}
+	})
 	for _, workers := range []int{1, 2, 4, 8, 16} {
 		b.Run(sizeName(workers), func(b *testing.B) {
 			ex := NewExecutor(Config{
