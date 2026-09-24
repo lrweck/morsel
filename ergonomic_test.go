@@ -249,7 +249,7 @@ func TestPanicAsErrorRecovered(t *testing.T) {
 func TestSmallQueuesBackpressure(t *testing.T) {
 	// MaxWorkers=1 and QueueCapacity=1 force the producer through the overflow
 	// queue and the space-blocking path.
-	ex := NewExecutor(Config{MaxWorkers: 1, MorselSize: 1, QueueCapacity: 1, StealAttempts: 1})
+	ex := NewExecutor(Config{MaxWorkers: 2, MorselSize: 1, QueueCapacity: 1, StealAttempts: 1})
 	var count atomic.Int64
 	if err := ex.ForEachSlice(context.Background(), make([]int, 2000), func(int) error {
 		count.Add(1)

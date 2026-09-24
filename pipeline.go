@@ -35,9 +35,16 @@ func (s *scratch[T]) put(b *[]T) { s.pool.Put(b) }
 type Pipeline[Src, Out any] struct {
 	feed  func(ex *Executor, ctx context.Context, feed func(engine.Work[Src]) bool) error
 	apply func(m engine.Work[Src], emit func(engine.Work[Out]) error) error
+	// size is the known number of source items, or -1 when the source length
+	// is not known ahead of time. It lets a small pipeline skip the pool.
+	size int
 }
 
 // run wires the source into a fresh engine run and drives it to completion.
+//
+// When parallelism cannot help — the source is a single morsel, or MaxWorkers
+// is 1 — the whole pipeline runs in order on the calling goroutine, with no
+// pool, queues or extra goroutines.
 func (p Pipeline[Src, Out]) run[S any](
 	ctx context.Context,
 	ex *Executor,
@@ -45,6 +52,9 @@ func (p Pipeline[Src, Out]) run[S any](
 	newState func() S,
 	merge func(dst *S, src S),
 ) (S, error) {
+	if int(ex.cfg.MaxWorkers) <= 1 || (p.size >= 0 && p.size <= int(ex.cfg.MorselSize)) {
+		return p.runSequential(ctx, ex, process, newState, merge)
+	}
 	r := engine.NewRunner(ex.cfg, ctx, process, newState)
 	feedErr := p.feed(ex, ctx, r.Publish)
 	r.Done()
@@ -56,11 +66,44 @@ func (p Pipeline[Src, Out]) run[S any](
 	return r.Merge(merge), waitErr
 }
 
+// runSequential feeds the source straight into process on the caller.
+func (p Pipeline[Src, Out]) runSequential[S any](
+	ctx context.Context,
+	ex *Executor,
+	process func(w *engine.Worker[Src, S], m engine.Work[Src]) error,
+	newState func() S,
+	merge func(dst *S, src S),
+) (S, error) {
+	w := &engine.Worker[Src, S]{State: newState()}
+	var runErr error
+	var morsels uint64
+	feedErr := p.feed(ex, ctx, func(m engine.Work[Src]) bool {
+		if ctx.Err() != nil {
+			runErr = ctx.Err()
+			return false
+		}
+		morsels++
+		if err := process(w, m); err != nil {
+			runErr = err
+			return false
+		}
+		return true
+	})
+	acc := newState()
+	merge(&acc, w.State)
+	ex.record(engine.Stats{MorselsCreated: morsels, MorselsExecuted: morsels})
+	if feedErr != nil {
+		return acc, feedErr
+	}
+	return acc, runErr
+}
+
 func identity[T any](m engine.Work[T], emit func(engine.Work[T]) error) error { return emit(m) }
 
 // Slice produces the elements of data, sub-slicing by index without copying.
 func Slice[T any](data []T) Pipeline[T, T] {
 	return Pipeline[T, T]{
+		size: len(data),
 		feed: func(ex *Executor, ctx context.Context, feed func(engine.Work[T]) bool) error {
 			size := int(ex.cfg.MorselSize)
 			for start := 0; start < len(data); start += size {
@@ -81,6 +124,7 @@ func Slice[T any](data []T) Pipeline[T, T] {
 // Range produces the integers in [start, end).
 func Range(start, end int) Pipeline[int, int] {
 	return Pipeline[int, int]{
+		size: end - start,
 		feed: func(ex *Executor, ctx context.Context, feed func(engine.Work[int]) bool) error {
 			size := int(ex.cfg.MorselSize)
 			for lo := start; lo < end; lo += size {
@@ -105,6 +149,7 @@ func Range(start, end int) Pipeline[int, int] {
 // Iter produces the elements of an iterator, batched by MorselSize.
 func Iter[T any](seq iter.Seq[T]) Pipeline[T, T] {
 	return Pipeline[T, T]{
+		size: -1,
 		feed: func(ex *Executor, ctx context.Context, feed func(engine.Work[T]) bool) error {
 			if seq == nil {
 				return ErrNilSource
@@ -120,6 +165,7 @@ func Iter[T any](seq iter.Seq[T]) Pipeline[T, T] {
 // IterErr is Iter for a fallible iterator.
 func IterErr[T any](seq iter.Seq2[T, error]) Pipeline[T, T] {
 	return Pipeline[T, T]{
+		size: -1,
 		feed: func(ex *Executor, ctx context.Context, feed func(engine.Work[T]) bool) error {
 			if seq == nil {
 				return ErrNilSource
@@ -133,6 +179,7 @@ func IterErr[T any](seq iter.Seq2[T, error]) Pipeline[T, T] {
 // From wraps a custom morsel source.
 func From[T any](src Source[T]) Pipeline[T, T] {
 	return Pipeline[T, T]{
+		size: -1,
 		feed: func(_ *Executor, ctx context.Context, feed func(engine.Work[T]) bool) error {
 			if src == nil {
 				return ErrNilSource
@@ -264,6 +311,7 @@ func feedSeq[T any](
 func (p Pipeline[Src, T]) Map[U any](fn func(T) U) Pipeline[Src, U] {
 	scratch := newScratch[U]()
 	return Pipeline[Src, U]{
+		size: p.size,
 		feed: p.feed,
 		apply: func(m engine.Work[Src], emit func(engine.Work[U]) error) error {
 			if fn == nil {
@@ -288,6 +336,7 @@ func (p Pipeline[Src, T]) Map[U any](fn func(T) U) Pipeline[Src, U] {
 func (p Pipeline[Src, T]) MapE[U any](fn func(T) (U, error)) Pipeline[Src, U] {
 	scratch := newScratch[U]()
 	return Pipeline[Src, U]{
+		size: p.size,
 		feed: p.feed,
 		apply: func(m engine.Work[Src], emit func(engine.Work[U]) error) error {
 			if fn == nil {
@@ -325,6 +374,7 @@ func (p Pipeline[Src, T]) MapE[U any](fn func(T) (U, error)) Pipeline[Src, U] {
 func (p Pipeline[Src, T]) Filter(pred func(T) bool) Pipeline[Src, T] {
 	scratch := newScratch[T]()
 	return Pipeline[Src, T]{
+		size: p.size,
 		feed: p.feed,
 		apply: func(m engine.Work[Src], emit func(engine.Work[T]) error) error {
 			if pred == nil {
@@ -356,6 +406,7 @@ func (p Pipeline[Src, T]) Filter(pred func(T) bool) Pipeline[Src, T] {
 func (p Pipeline[Src, T]) FlatMap[U any](fn func(T) []U) Pipeline[Src, U] {
 	scratch := newScratch[U]()
 	return Pipeline[Src, U]{
+		size: p.size,
 		feed: p.feed,
 		apply: func(m engine.Work[Src], emit func(engine.Work[U]) error) error {
 			if fn == nil {

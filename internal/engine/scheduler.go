@@ -271,7 +271,7 @@ func (w *Worker[T, S]) execute(m Work[T]) {
 	r := w.run
 	r.pending.Add(-1)
 	w.stats.MorselsExecuted++
-	if err := r.invoke(w, m); err != nil {
+	if err := invoke(r.cfg, r.process, w, m); err != nil {
 		r.fail(err)
 	}
 	r.signal()
@@ -280,9 +280,14 @@ func (w *Worker[T, S]) execute(m Work[T]) {
 // invoke runs process, optionally turning a user panic into an error. An
 // assertion panic is always re-raised: a corrupt invariant must crash rather
 // than be reported as an ordinary failure.
-func (r *Runner[T, S]) invoke(w *Worker[T, S], m Work[T]) (err error) {
-	if !r.cfg.RecoverPanics {
-		return r.process(w, m)
+func invoke[T, S any](
+	cfg Config,
+	process func(w *Worker[T, S], m Work[T]) error,
+	w *Worker[T, S],
+	m Work[T],
+) (err error) {
+	if !cfg.RecoverPanics {
+		return process(w, m)
 	}
 	defer func() {
 		rec := recover()
@@ -298,7 +303,7 @@ func (r *Runner[T, S]) invoke(w *Worker[T, S], m Work[T]) (err error) {
 		}
 		err = fmt.Errorf("morsel: recovered panic: %v", rec)
 	}()
-	return r.process(w, m)
+	return process(w, m)
 }
 
 // steal tries a bounded number of victims, starting from a per-worker
@@ -409,6 +414,10 @@ func xorshift(x uint64) uint64 {
 
 // RunSlice is the slice path: it morselizes data by index without copying, then
 // runs process on each morsel.
+//
+// When parallelism cannot help — the whole input fits in a single morsel, or
+// MaxWorkers is 1 — it runs on the caller with no worker pool, no queues and no
+// extra goroutines.
 func RunSlice[T, S any](
 	cfg Config,
 	ctx context.Context,
@@ -417,6 +426,10 @@ func RunSlice[T, S any](
 	newState func() S,
 	merge func(dst *S, src S),
 ) (S, Stats, error) {
+	cfg = cfg.Normalize()
+	if int(cfg.MaxWorkers) <= 1 || len(data) <= int(cfg.MorselSize) {
+		return runSequentialSlice(ctx, cfg, data, process, newState, merge)
+	}
 	r := NewRunner(cfg, ctx, process, newState)
 	size := int(cfg.MorselSize)
 	for start := 0; start < len(data); start += size {
@@ -430,9 +443,39 @@ func RunSlice[T, S any](
 	return r.Merge(merge), stats, err
 }
 
+// runSequentialSlice runs the morsels in order on the calling goroutine.
+func runSequentialSlice[T, S any](
+	ctx context.Context,
+	cfg Config,
+	data []T,
+	process func(w *Worker[T, S], m Work[T]) error,
+	newState func() S,
+	merge func(dst *S, src S),
+) (S, Stats, error) {
+	w := &Worker[T, S]{State: newState()}
+	size := int(cfg.MorselSize)
+	var count uint64
+	var err error
+	for start := 0; start < len(data); start += size {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			break
+		}
+		end := min(start+size, len(data))
+		count++
+		if e := invoke(cfg, process, w, Work[T]{Start: start, Items: data[start:end]}); e != nil {
+			err = e
+			break
+		}
+	}
+	acc := newState()
+	merge(&acc, w.State)
+	return acc, Stats{MorselsCreated: count, MorselsExecuted: count}, err
+}
+
 // RunIter is the iterator path: a bounded producer materializes morsels of at
 // most MorselSize items, so memory stays O(in-flight morsels) instead of
-// O(total elements).
+// O(total elements). With MaxWorkers 1 it runs on the caller.
 func RunIter[T, S any](
 	cfg Config,
 	ctx context.Context,
@@ -441,6 +484,10 @@ func RunIter[T, S any](
 	newState func() S,
 	merge func(dst *S, src S),
 ) (S, Stats, error) {
+	cfg = cfg.Normalize()
+	if int(cfg.MaxWorkers) <= 1 {
+		return runSequentialIter(ctx, cfg, seq, process, newState, merge)
+	}
 	r := NewRunner(cfg, ctx, process, newState)
 	size := int(cfg.MorselSize)
 	buf := make([]T, 0, size)
@@ -464,4 +511,46 @@ func RunIter[T, S any](
 	r.Done()
 	stats, err := r.Wait()
 	return r.Merge(merge), stats, err
+}
+
+// runSequentialIter runs the iterator in order on the calling goroutine.
+func runSequentialIter[T, S any](
+	ctx context.Context,
+	cfg Config,
+	seq iter.Seq[T],
+	process func(w *Worker[T, S], m Work[T]) error,
+	newState func() S,
+	merge func(dst *S, src S),
+) (S, Stats, error) {
+	w := &Worker[T, S]{State: newState()}
+	size := int(cfg.MorselSize)
+	buf := make([]T, 0, size)
+	var count uint64
+	var err error
+	seq(func(v T) bool {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			return false
+		}
+		buf = append(buf, v)
+		if len(buf) < size {
+			return true
+		}
+		count++
+		if e := invoke(cfg, process, w, Work[T]{Items: buf}); e != nil {
+			err = e
+			return false
+		}
+		buf = make([]T, 0, size)
+		return true
+	})
+	if err == nil && len(buf) > 0 {
+		count++
+		if e := invoke(cfg, process, w, Work[T]{Items: buf}); e != nil {
+			err = e
+		}
+	}
+	acc := newState()
+	merge(&acc, w.State)
+	return acc, Stats{MorselsCreated: count, MorselsExecuted: count}, err
 }
