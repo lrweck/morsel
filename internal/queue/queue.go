@@ -1,5 +1,9 @@
 // Package queue provides the bounded, lock-free queues that back the parallel
 // scheduler. It is internal: only the parent morsel package may import it.
+//
+// Both queues use the per-cell sequence number scheme from Dmitry Vyukov's
+// bounded MPMC queue:
+// https://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue
 package queue
 
 import "sync/atomic"

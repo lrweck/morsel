@@ -4,7 +4,8 @@
 // workers. Each worker owns a bounded queue and steals from its peers when its
 // own queue runs dry; the pool grows on demand and parks workers that find no
 // work. Every queue is bounded, so memory never scales with the input size. The
-// design follows Leis et al., "Morsel-Driven Parallelism" (SIGMOD 2014).
+// design follows Leis et al., "Morsel-Driven Parallelism" (SIGMOD 2014); the
+// README's References section lists the other works it draws on.
 //
 // # Two surfaces
 //

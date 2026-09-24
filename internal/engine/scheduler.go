@@ -340,6 +340,11 @@ func invoke[T, S any](
 // steal tries a bounded number of victims, starting from a per-worker
 // pseudo-random offset so no single worker is always the target. The generator
 // is a xorshift on the worker's own state: no lock, no allocation.
+//
+// The strategy is the work-stealing of Chase & Lev, "Dynamic Circular
+// Work-Stealing Deque" (SPAA 2005) — steal from the far end, in a random-ish
+// order. The deque itself is Vyukov's SPMC queue (see internal/queue); see the
+// README's References for why.
 func (r *Runner[T, S]) steal(w *Worker[T, S]) (Work[T], bool) {
 	live := int(r.live.Load())
 	if live <= 1 {

@@ -36,6 +36,7 @@ stealing**, **bounded** queues, and **zero dependencies**. Based on Leis et al.,
 - [Package layout](#package-layout)
 - [API reference](#api-reference)
 - [Benchmarks](#benchmarks)
+- [References](#references)
 
 ## Install
 
@@ -844,6 +845,52 @@ Same 1M-line (~14 MB) file the other benchmarks generate, `GOMAXPROCS=20`,
   channel send per line.
 - Prefer **smaller chunks (64–256 KiB)**: more morsels means better balancing.
   1 MiB gives only ~14 morsels for this file, so the tail dominates.
+
+## References
+
+morsel is an independent implementation. It borrows ideas, not code — the
+module still has no dependencies. The works behind the design:
+
+- **[1] Morsel-Driven Parallelism** — Viktor Leis, Peter Boncz, Alfons Kemper,
+  Thomas Neumann. SIGMOD 2014. <https://doi.org/10.1145/2588555.2610507>
+  The core of it: split the input into morsels and let a dispatcher hand them to
+  worker threads continuously, so the degree of parallelism is a runtime
+  decision rather than a plan-time one. We take the morselization and the
+  elastic dispatcher, not the NUMA placement.
+
+- **[2] A bounded MPMC queue** — Dmitry Vyukov, 1024cores.net.
+  <https://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue>
+  The per-cell sequence number scheme in `internal/queue`: the SPMC queues the
+  workers pull from and the MPMC overflow. The rule that a cell's sequence number
+  decides whose turn it is to touch it is his.
+
+- **[3] Dynamic Circular Work-Stealing Deque** — David Chase, Yossi Lev. SPAA
+  2005. <https://doi.org/10.1145/1073970.1073974>
+  The reference work-stealing deque, and where the spec started. We ship [2]
+  instead: Chase-Lev's benign stale read is still reported as a data race by
+  `go test -race`, and a library should be clean under `-race` out of the box.
+  What survives is the strategy — a thief takes from the far end and probes
+  victims in a pseudo-random order.
+
+- **[4] `iter`** — Go's push iterators (Go 1.23). <https://pkg.go.dev/iter>
+  The shape of `Source`, `Batch`, `ForEachSeq` and the `Iter`/`IterErr`/`Rows`
+  adapters: an iterator is a function you hand a `yield` callback, and stopping
+  is `yield` returning false.
+
+- **[5] `bufio.Scanner.Bytes`** — <https://pkg.go.dev/bufio#Scanner.Bytes>
+  The borrowed-slice idiom behind `ChunksPooled`: hand out a view into a buffer
+  that gets reused, and document that the view is only valid until the next call.
+
+- **[6] Dave Cheney** — *Don't force allocations on the callers of your API*
+  (2019) and `bytereader` (BSD-2-Clause).
+  <https://dave.cheney.net/2019/09/05/dont-force-allocations-on-the-callers-of-your-api> ·
+  <https://github.com/davecheney/bytereader>
+  The article is the argument behind `Batch.Release`: the callee should not
+  decide the allocation policy, so `Chunks` keeps returning owned chunks and
+  `ChunksPooled` offers the borrowing variant rather than forcing either. We
+  read `bytereader` while designing it — a sliding window over one reader with
+  in-order release — and it does not fit a multi-consumer pipeline, so no code
+  was taken from it.
 
 ## License
 
