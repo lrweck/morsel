@@ -147,14 +147,16 @@ Measured (`go test -bench -benchtime=3s`, `GOMAXPROCS=20`):
 
 | benchmark | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| `TinyInput/sequential` — 100 elements, on the caller | **358 ns** | 304 | 6 |
-| `TinyInput/pooled` — 100 elements, forced through the pool | 15.9 µs | 8.9 KB | 34 |
-| `MorselWorkers/1` — 1M heavy, one worker (caller) | 56.4 ms | 152 | 4 |
-| `BaselineLoop` — 1M heavy, plain `for` loop | 61.9 ms | 0 | 0 |
+| `TinyInput/sequential` — 100 elements, on the caller | **344 ns** | 304 | 6 |
+| `TinyInput/pooled` — 100 elements, forced through the pool | 15.2 µs | 7.4 KB | 32 |
+| `MorselWorkers/1` — 1M heavy, one worker (caller) | 55.0 ms | 152 | 4 |
+| `BaselineLoop` — 1M heavy, plain `for` loop | 59.7 ms | 0 | 0 |
 
-A tiny input is ~**44×** cheaper and ~**29×** lighter on allocation when it stays
+A tiny input is ~**44×** cheaper and ~**24×** lighter on allocation when it stays
 on the caller, and a single worker is within ~10% of a hand-written loop: when
-there is nothing to parallelize, the engine adds essentially nothing.
+there is nothing to parallelize, the engine adds essentially nothing. A run that
+starts only a few workers allocates only those: the queues, the worker state and
+the overflow buffer are all created on demand.
 
 ## Compared to traditional Go
 
@@ -664,23 +666,23 @@ is a traditional goroutine pool fed by a channel, and `Morsel*` is this library.
 
 | approach | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| `BaselineLoop` — plain `for` loop | 61.9 ms | 0 | 0 |
-| `ChannelPool` — goroutine pool + channel | 16.0 ms | 1.7 KB | 21 |
-| **`Morsel`** — this library | **7.8 ms** | 36 KB | 114 |
+| `BaselineLoop` — plain `for` loop | 59.7 ms | 0 | 0 |
+| `ChannelPool` — goroutine pool + channel | 15.7 ms | 1.7 KB | 22 |
+| **`Morsel`** — this library | **7.3 ms** | 36 KB | 114 |
 
-**~7.9× faster than the plain loop and ~2× faster than the channel pool.**
+**~8× faster than the plain loop and ~2× faster than the channel pool.**
 
 ### Scaling with workers (`Morsel`, same heavy workload)
 
 | `MaxWorkers` | ns/op | B/op |
 |---:|---:|---:|
-| 1 (runs on the caller) | 56.4 ms | 152 |
-| 2 | 33.6 ms | 5.5 KB |
-| 4 | 18.8 ms | 8.8 KB |
-| 8 | 12.2 ms | 15 KB |
-| 16 | 8.3 ms | 29 KB |
+| 1 (runs on the caller) | 55.0 ms | 152 |
+| 2 | 31.6 ms | 5.5 KB |
+| 4 | 17.4 ms | 8.8 KB |
+| 8 | 11.2 ms | 15 KB |
+| 16 | 7.8 ms | 29 KB |
 
-One worker is within ~10% of the plain loop (`BaselineLoop` 61.9 ms) — the
+One worker is within ~10% of the plain loop (`BaselineLoop` 59.7 ms) — the
 sequential path adds almost nothing.
 
 ### Little work
@@ -689,21 +691,21 @@ A tiny **input** is free — it never touches the pool:
 
 | benchmark | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| `TinyInput/sequential` — 100 elements, on the caller | **358 ns** | 304 | 6 |
-| `TinyInput/pooled` — 100 elements, forced through the pool | 15.9 µs | 8.9 KB | 34 |
+| `TinyInput/sequential` — 100 elements, on the caller | **344 ns** | 304 | 6 |
+| `TinyInput/pooled` — 100 elements, forced through the pool | 15.2 µs | 7.4 KB | 32 |
 
-~**44×** cheaper and ~**29×** lighter on allocation when it stays on the caller.
+~**44×** cheaper and ~**24×** lighter on allocation when it stays on the caller.
 
 A large input of **trivial** work is the opposite: the library still scales, but
 the per-element call overhead keeps it behind a plain loop.
 
 | benchmark | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| `Light/baseline` — 1M `sum += v`, plain loop | **331 µs** | 0 | 0 |
-| `Light/1` — 1M trivial, one worker | 1.60 ms | 152 | 4 |
-| `Light/16` — 1M trivial, 16 workers | 0.91 ms | 29 KB | 92 |
+| `Light/baseline` — 1M `sum += v`, plain loop | **359 µs** | 0 | 0 |
+| `Light/1` — 1M trivial, one worker | 1.34 ms | 152 | 4 |
+| `Light/16` — 1M trivial, 16 workers | 0.87 ms | 29 KB | 92 |
 
-It scales ~1.8× from 1 to 16 workers but never catches the plain loop: a
+It scales ~1.5× from 1 to 16 workers but never catches the plain loop: a
 callback-based engine cannot inline a few-ns body. Use it when the per-element
 work is real.
 

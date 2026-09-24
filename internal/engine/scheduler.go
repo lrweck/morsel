@@ -40,9 +40,11 @@ type Runner[T, S any] struct {
 	newState func() S
 
 	workers []*Worker[T, S]
-	inject  *queue.MPMC[Work[T]] // bounded overflow queue
-	space   chan struct{}        // wakes a producer blocked on a full pool
-	stop    chan struct{}
+	// inject is the bounded overflow queue, allocated on first use: only runs
+	// that fill every worker queue ever touch it.
+	inject atomic.Pointer[queue.MPMC[Work[T]]]
+	space  chan struct{} // wakes a producer blocked on a full pool
+	stop   chan struct{}
 
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -77,19 +79,11 @@ func NewRunner[T, S any](
 		cfg:      cfg,
 		process:  process,
 		newState: newState,
-		inject:   queue.NewMPMC[Work[T]](int(cfg.QueueCapacity)),
 		space:    make(chan struct{}, 1),
 		stop:     make(chan struct{}),
 		workers:  make([]*Worker[T, S], cfg.MaxWorkers),
 	}
 	r.cond = sync.NewCond(&r.mu)
-	for i := range r.workers {
-		r.workers[i] = &Worker[T, S]{
-			id:  i,
-			run: r,
-			rng: uint64(i+1) * 0x9E3779B97F4A7C15,
-		}
-	}
 	return r
 }
 
@@ -108,6 +102,12 @@ func (r *Runner[T, S]) spawn() {
 	}
 	id := int(r.live.Load())
 	w := r.workers[id]
+	if w == nil {
+		// The worker itself is allocated here too, so a run pays for the
+		// workers it actually starts rather than for MaxWorkers of them.
+		w = &Worker[T, S]{id: id, run: r, rng: uint64(id+1) * 0x9E3779B97F4A7C15}
+		r.workers[id] = w
+	}
 	w.queue = queue.NewSPMC[Work[T]](int(r.cfg.QueueCapacity))
 	w.cond = sync.NewCond(&w.mu)
 	w.State = r.newState()
@@ -115,6 +115,21 @@ func (r *Runner[T, S]) spawn() {
 	r.wg.Add(1)
 	r.mu.Unlock()
 	go w.loop()
+}
+
+// injectQueue returns the shared overflow queue, creating it on first use. The
+// overflow only sees traffic when every worker queue is full, so most runs
+// never allocate it. Only the producer calls this, so a plain load-then-store
+// would do; the CAS keeps it correct if that ever stops being true.
+func (r *Runner[T, S]) injectQueue() *queue.MPMC[Work[T]] {
+	if q := r.inject.Load(); q != nil {
+		return q
+	}
+	q := queue.NewMPMC[Work[T]](int(r.cfg.QueueCapacity))
+	if r.inject.CompareAndSwap(nil, q) {
+		return q
+	}
+	return r.inject.Load()
 }
 
 // Publish hands a morsel directly to a worker queue, round-robin, so the hot
@@ -147,7 +162,7 @@ func (r *Runner[T, S]) Publish(m Work[T]) bool {
 				return true
 			}
 		}
-		if r.inject.Enqueue(m) {
+		if r.injectQueue().Enqueue(m) {
 			r.created.Add(1)
 			r.grow()
 			return true
@@ -257,9 +272,11 @@ func (w *Worker[T, S]) loop() {
 			w.execute(m)
 			continue
 		}
-		if m, ok := r.inject.Dequeue(); ok {
-			w.execute(m)
-			continue
+		if q := r.inject.Load(); q != nil {
+			if m, ok := q.Dequeue(); ok {
+				w.execute(m)
+				continue
+			}
 		}
 		if r.park(w) {
 			return
