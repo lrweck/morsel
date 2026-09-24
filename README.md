@@ -413,6 +413,11 @@ The library is designed so that **memory never scales with the input size**.
   exist at any time, plus one short-lived watcher during a run. They are created
   on demand and stop when the run ends — an `Executor` keeps none alive between
   runs.
+- **Sequential fast path.** If the whole input fits in one morsel, or
+  `MaxWorkers` is 1, the run happens in order on the calling goroutine — no
+  workers, no queues, no extra goroutines. The trigger is the input size, not
+  `MaxWorkers`: a small input stays sequential even with `MaxWorkers(8)`; lower
+  `MorselSize` if you want it parallel instead.
 
 Resource sketch at defaults (`MaxWorkers=GOMAXPROCS`, `MorselSize=256`,
 `QueueCapacity=256`):
