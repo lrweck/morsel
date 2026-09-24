@@ -57,7 +57,7 @@ package main
 import (
 	"fmt"
 
-	"morsel"
+	"github.com/lrweck/morsel"
 )
 
 type Debt struct{ Amount int }
@@ -409,7 +409,8 @@ The library is designed so that **memory never scales with the input size**.
   bounded queues. When the queues are full the producer blocks — that is the
   backpressure. Peak memory is
   `O(MaxWorkers × QueueCapacity × sizeof(morsel) + MorselSize × sizeof(T))`,
-  independent of how long the stream is.
+  plus one overflow queue when every worker queue fills; it does not grow with
+  the length of the stream.
 - **Slice path is zero-copy.** `Slice`/`ForEachSlice` hand out `data[start:end]`
   sub-slices; no element is ever copied into an intermediate buffer.
 - **Idle workers cost ~0 CPU.** A worker with no work parks on a `sync.Cond`;
@@ -430,7 +431,7 @@ Resource sketch at defaults (`MaxWorkers=GOMAXPROCS`, `MorselSize=256`,
 | Resource | Cost |
 |---|---|
 | Worker goroutines | ≤ `MaxWorkers` (+1 watcher while running) |
-| Queue memory | `(MaxWorkers + 1) × QueueCapacity × 40 B` ≈ 1.3 KB/worker |
+| Queue memory | `MaxWorkers × QueueCapacity × 40 B` ≈ 1.3 KB/worker, plus the overflow queue only when used |
 | In-flight elements | ≤ `MorselSize × sizeof(T)` per queued morsel |
 | Allocations per morsel (primitives) | **0** |
 | CPU when idle | ~0 (parked) |
@@ -549,11 +550,11 @@ also come last.
   sequence numbers (Vyukov): a single producer, consumers are the owner plus
   thieves. Lock-free and clean under `-race`.
 - **Injection → MPMC** (Vyukov) used only as *overflow* when every queue is
-  full. The hot path never touches it.
+  full. The hot path never touches it, and it is allocated only if that happens.
 - **Work stealing**: local queue → steal (pseudo-random victim, at most
   `StealAttempts`) → overflow → park.
 - **Lifecycle**: workers spin up on demand; they stop when `producerDone &&
-  pending == 0`. Parking/waking uses `sync.Cond` (~28ns vs ~126ns for a channel).
+  pending == 0`. Parking/waking uses `sync.Cond` (~28ns vs ~120ns for a channel).
 - **Explicit completion**: `producerDone + pending`, not just a `WaitGroup`.
 - **Lock-free reduce**: each worker folds into its own accumulator; the partials
   are merged at the end.
@@ -566,7 +567,7 @@ not importable from outside:
 ```
 morsel/                 public API
   morsel.go             doc, errors, Options, ForEach/ForEachE/...
-  config.go             Config, Stats (aliases), DefaultConfig
+  config.go             Config, Stats, DefaultConfig
   executor.go           Executor
   foreach.go map.go reduce.go   primitives
   pipeline.go           fluent pipeline + adapters
@@ -589,6 +590,17 @@ func (ex *Executor) MapSeq[T, R any](ctx context.Context, seq iter.Seq[T], fn fu
 func (ex *Executor) ReduceSlice[T, R any](ctx context.Context, data []T, init R, fold func(R, T) R, merge func(R, R) R) (R, error)
 func (ex *Executor) ReduceSeq[T, R any](ctx context.Context, seq iter.Seq[T], init R, fold func(R, T) R, merge func(R, R) R) (R, error)
 func (ex *Executor) Stats() Stats
+```
+
+**Package-level form of the slice primitives** (the shapes in the spec; the
+`Executor` methods above are the same calls):
+
+```go
+func ForEachSlice[T any](ctx context.Context, ex *Executor, data []T, fn func(T) error) error
+func MapSlice[T, R any](ctx context.Context, ex *Executor, data []T, fn func(T) R) ([]R, error)
+func MapSeq[T, R any](ctx context.Context, ex *Executor, seq iter.Seq[T], fn func(T) R) ([]R, error)
+func ReduceSlice[T, R any](ctx context.Context, ex *Executor, data []T, init R, fold func(R, T) R, merge func(R, R) R) (R, error)
+func ReduceSeq[T, R any](ctx context.Context, ex *Executor, seq iter.Seq[T], init R, fold func(R, T) R, merge func(R, R) R) (R, error)
 ```
 
 **Ergonomic (no explicit `Executor`):**
@@ -622,6 +634,21 @@ func (p Pipeline[Src, Out]) ForEachE(fn func(Out) error, opts ...Option) error
 func (p Pipeline[Src, Out]) Collect(opts ...Option) ([]Out, error)
 func (p Pipeline[Src, Out]) Reduce[U any](init U, fold func(U, Out) U, merge func(U, U) U, opts ...Option) (U, error)
 ```
+
+**Types:**
+
+```go
+// A materialized morsel. Iterators have no random access, so their elements
+// arrive in Batches.
+type Batch[T any] struct{ Items []T }
+
+// Source yields Batches to a single producer; returning an error aborts the
+// run.
+type Source[T any] func(yield func(Batch[T]) bool) error
+```
+
+`Config` is described in [Options](#options) and `Stats` in
+[Reusable executor and stats](#reusable-executor-and-stats).
 
 Requires **Go 1.27** (generic methods).
 
