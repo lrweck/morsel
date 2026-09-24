@@ -15,7 +15,7 @@ stealing**, **bounded** queues, and **zero dependencies**. Based on Leis et al.,
 <p align="center">
   <picture>
     <source srcset="docs/morsel.svg" type="image/svg+xml">
-    <img src="docs/morsel.png" width="900"
+    <img src="docs/morsel.png" width="1000"
          alt="morsels flow from a source into per-worker queues; busy workers light up and an idle worker steals from a busy one">
   </picture>
 </p>
