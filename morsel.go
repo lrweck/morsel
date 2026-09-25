@@ -33,7 +33,9 @@
 //
 // Slice, Range, Iter, IterErr, Chunks, Lines, Rows and From produce a
 // [Pipeline]; Map, MapE, Filter and FlatMap transform it; ForEach, ForEachE,
-// Collect and Reduce consume it.
+// Collect and Reduce consume it. Every stage and terminal has an optional
+// Batch variant (MapBatch, ForEachBatch, ...) that runs once per morsel over
+// []Out instead of once per element.
 //
 // # Errors and cancellation
 //
@@ -86,6 +88,13 @@ func StealAttempts(n uint) Option { return func(o *options) { o.StealAttempts = 
 // RecoverPanics converts worker panics into errors.
 func RecoverPanics(enable bool) Option {
 	return func(o *options) { o.RecoverPanics = enable }
+}
+
+// Eager publishes a partial morsel from an iterator source whenever no work
+// is outstanding — workers would otherwise idle — instead of waiting to fill
+// it to MorselSize. Under load morsels still fill as usual.
+func Eager(enable bool) Option {
+	return func(o *options) { o.Eager = enable }
 }
 
 // WithContext ties the run to ctx. Cancelling ctx aborts the run.
@@ -165,4 +174,52 @@ func ForEachSeqErr[T any](seq iter.Seq2[T, error], fn func(T) error, opts ...Opt
 	}
 	ctx, ex := resolve(opts)
 	return ex.ForEachSeqErr(ctx, seq, fn)
+}
+
+// ForEachBatch applies fn once per morsel with the morsel's items, instead
+// of once per element. The batch is only valid during the call; do not
+// retain it. Morsel size is controlled by MorselSize, as usual.
+func ForEachBatch[T any](data []T, fn func([]T), opts ...Option) error {
+	if fn == nil {
+		return ErrNilFunction
+	}
+	ctx, ex := resolve(opts)
+	return ex.ForEachSliceBatch(ctx, data, func(b []T) error { fn(b); return nil })
+}
+
+// ForEachEBatch is ForEachBatch for a fallible fn. The first error aborts
+// the run and is returned.
+func ForEachEBatch[T any](data []T, fn func([]T) error, opts ...Option) error {
+	if fn == nil {
+		return ErrNilFunction
+	}
+	ctx, ex := resolve(opts)
+	return ex.ForEachSliceBatch(ctx, data, fn)
+}
+
+// ForEachSeqBatch is ForEachBatch for an iterator.
+func ForEachSeqBatch[T any](seq iter.Seq[T], fn func([]T), opts ...Option) error {
+	if fn == nil {
+		return ErrNilFunction
+	}
+	ctx, ex := resolve(opts)
+	return ex.ForEachSeqBatch(ctx, seq, func(b []T) error { fn(b); return nil })
+}
+
+// ForEachSeqEBatch is ForEachSeqBatch for a fallible fn.
+func ForEachSeqEBatch[T any](seq iter.Seq[T], fn func([]T) error, opts ...Option) error {
+	if fn == nil {
+		return ErrNilFunction
+	}
+	ctx, ex := resolve(opts)
+	return ex.ForEachSeqBatch(ctx, seq, fn)
+}
+
+// ForEachSeqErrBatch is ForEachSeqBatch for a fallible iterator.
+func ForEachSeqErrBatch[T any](seq iter.Seq2[T, error], fn func([]T) error, opts ...Option) error {
+	if fn == nil {
+		return ErrNilFunction
+	}
+	ctx, ex := resolve(opts)
+	return ex.ForEachSeqErrBatch(ctx, seq, fn)
 }

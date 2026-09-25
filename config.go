@@ -20,6 +20,11 @@ type Config struct {
 	// RecoverPanics turns a panicking callback into an error instead of
 	// crashing the process.
 	RecoverPanics bool
+	// Eager publishes a partial morsel from an iterator source whenever no
+	// work is outstanding — workers would otherwise idle — instead of
+	// waiting to fill it to MorselSize. Under load morsels still fill as
+	// usual. Slice sources already publish immediately and ignore it.
+	Eager bool
 }
 
 // DefaultConfig returns the default configuration.
@@ -50,6 +55,7 @@ func (c Config) engine() engine.Config {
 		QueueCapacity: c.QueueCapacity,
 		StealAttempts: c.StealAttempts,
 		RecoverPanics: c.RecoverPanics,
+		Eager:         c.Eager,
 	}
 }
 
@@ -60,6 +66,7 @@ func configFromEngine(c engine.Config) Config {
 		QueueCapacity: c.QueueCapacity,
 		StealAttempts: c.StealAttempts,
 		RecoverPanics: c.RecoverPanics,
+		Eager:         c.Eager,
 	}
 }
 

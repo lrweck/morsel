@@ -33,12 +33,22 @@ func (s *scratch[T]) put(b *[]T) { s.pool.Put(b) }
 // forward while Src is carried along, so a terminal can build a worker whose
 // per-worker state is concrete and no value is boxed.
 type Pipeline[Src, Out any] struct {
-	feed  func(ex *Executor, ctx context.Context, feed func(engine.Work[Src]) bool) error
+	feed  func(ex *Executor, ctx context.Context, feed engine.Publisher[Src]) error
 	apply func(m engine.Work[Src], emit func(engine.Work[Out]) error) error
 	// size is the known number of source items, or -1 when the source length
 	// is not known ahead of time. It lets a small pipeline skip the pool.
 	size int
 }
+
+// inlinePublisher adapts a publish func to an engine.Publisher for runs
+// without queues. It reports no backlog, so an eager producer publishes
+// every item immediately on the sequential path.
+type inlinePublisher[T any] struct {
+	publish func(engine.Work[T]) bool
+}
+
+func (p inlinePublisher[T]) Publish(m engine.Work[T]) bool { return p.publish(m) }
+func (p inlinePublisher[T]) Pending() int64                { return 0 }
 
 // run wires the source into a fresh engine run and drives it to completion.
 //
@@ -56,7 +66,7 @@ func (p Pipeline[Src, Out]) run[S any](
 		return p.runSequential(ctx, ex, process, newState, merge)
 	}
 	r := engine.NewRunner(ex.cfg, ctx, process, newState)
-	feedErr := p.feed(ex, ctx, r.Publish)
+	feedErr := p.feed(ex, ctx, r)
 	r.Done()
 	stats, waitErr := r.Wait()
 	ex.record(stats)
@@ -77,7 +87,7 @@ func (p Pipeline[Src, Out]) runSequential[S any](
 	w := &engine.Worker[Src, S]{State: newState()}
 	var runErr error
 	var morsels uint64
-	feedErr := p.feed(ex, ctx, func(m engine.Work[Src]) bool {
+	feedErr := p.feed(ex, ctx, inlinePublisher[Src]{publish: func(m engine.Work[Src]) bool {
 		if ctx.Err() != nil {
 			runErr = ctx.Err()
 			return false
@@ -92,7 +102,7 @@ func (p Pipeline[Src, Out]) runSequential[S any](
 			return false
 		}
 		return true
-	})
+	}})
 	acc := newState()
 	merge(&acc, w.State)
 	ex.record(engine.Stats{MorselsCreated: morsels, MorselsExecuted: morsels})
@@ -108,14 +118,14 @@ func identity[T any](m engine.Work[T], emit func(engine.Work[T]) error) error { 
 func Slice[T any](data []T) Pipeline[T, T] {
 	return Pipeline[T, T]{
 		size: len(data),
-		feed: func(ex *Executor, ctx context.Context, feed func(engine.Work[T]) bool) error {
+		feed: func(ex *Executor, ctx context.Context, feed engine.Publisher[T]) error {
 			size := int(ex.cfg.MorselSize)
 			for start := 0; start < len(data); start += size {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
 				end := min(start+size, len(data))
-				if !feed(engine.Work[T]{Start: start, Items: data[start:end]}) {
+				if !feed.Publish(engine.Work[T]{Start: start, Items: data[start:end]}) {
 					return nil
 				}
 			}
@@ -129,7 +139,7 @@ func Slice[T any](data []T) Pipeline[T, T] {
 func Range(start, end int) Pipeline[int, int] {
 	return Pipeline[int, int]{
 		size: end - start,
-		feed: func(ex *Executor, ctx context.Context, feed func(engine.Work[int]) bool) error {
+		feed: func(ex *Executor, ctx context.Context, feed engine.Publisher[int]) error {
 			size := int(ex.cfg.MorselSize)
 			for lo := start; lo < end; lo += size {
 				if ctx.Err() != nil {
@@ -140,7 +150,7 @@ func Range(start, end int) Pipeline[int, int] {
 				for i := range items {
 					items[i] = lo + i
 				}
-				if !feed(engine.Work[int]{Items: items}) {
+				if !feed.Publish(engine.Work[int]{Items: items}) {
 					return nil
 				}
 			}
@@ -154,7 +164,7 @@ func Range(start, end int) Pipeline[int, int] {
 func Iter[T any](seq iter.Seq[T]) Pipeline[T, T] {
 	return Pipeline[T, T]{
 		size: -1,
-		feed: func(ex *Executor, ctx context.Context, feed func(engine.Work[T]) bool) error {
+		feed: func(ex *Executor, ctx context.Context, feed engine.Publisher[T]) error {
 			if seq == nil {
 				return ErrNilSource
 			}
@@ -170,7 +180,7 @@ func Iter[T any](seq iter.Seq[T]) Pipeline[T, T] {
 func IterErr[T any](seq iter.Seq2[T, error]) Pipeline[T, T] {
 	return Pipeline[T, T]{
 		size: -1,
-		feed: func(ex *Executor, ctx context.Context, feed func(engine.Work[T]) bool) error {
+		feed: func(ex *Executor, ctx context.Context, feed engine.Publisher[T]) error {
 			if seq == nil {
 				return ErrNilSource
 			}
@@ -184,7 +194,7 @@ func IterErr[T any](seq iter.Seq2[T, error]) Pipeline[T, T] {
 func From[T any](src Source[T]) Pipeline[T, T] {
 	return Pipeline[T, T]{
 		size: -1,
-		feed: func(_ *Executor, ctx context.Context, feed func(engine.Work[T]) bool) error {
+		feed: func(_ *Executor, ctx context.Context, feed engine.Publisher[T]) error {
 			if src == nil {
 				return ErrNilSource
 			}
@@ -193,7 +203,7 @@ func From[T any](src Source[T]) Pipeline[T, T] {
 					releaseBatch(m)
 					return false
 				}
-				if !feed(engine.Work[T]{Items: m.Items, Release: m.Release}) {
+				if !feed.Publish(engine.Work[T]{Items: m.Items, Release: m.Release}) {
 					// Not taken: the engine will never see it, so release here.
 					releaseBatch(m)
 					return false
@@ -269,7 +279,7 @@ func ChunksPooled(r io.Reader, size int) Pipeline[[]byte, []byte] {
 	}
 	return Pipeline[[]byte, []byte]{
 		size: -1,
-		feed: func(_ *Executor, ctx context.Context, feed func(engine.Work[[]byte]) bool) error {
+		feed: func(_ *Executor, ctx context.Context, feed engine.Publisher[[]byte]) error {
 			if r == nil {
 				return ErrNilSource
 			}
@@ -288,7 +298,7 @@ func ChunksPooled(r io.Reader, size int) Pipeline[[]byte, []byte] {
 				if n > 0 {
 					cb.items[0] = cb.buf[:n]
 					m := engine.Work[[]byte]{Items: cb.items[:], Release: cb.release}
-					if !feed(m) {
+					if !feed.Publish(m) {
 						pool.Put(cb)
 						return nil
 					}
@@ -355,12 +365,13 @@ func Rows[T any](next func() (T, bool, error)) Pipeline[T, T] {
 func feedSeq[T any](
 	ex *Executor,
 	ctx context.Context,
-	feed func(engine.Work[T]) bool,
+	feed engine.Publisher[T],
 	seq iter.Seq2[T, error],
 ) error {
 	size := int(ex.cfg.MorselSize)
 	buf := make([]T, 0, size)
 	aborted := false
+	eager := ex.cfg.Eager
 	var seqErr error
 	seq(func(v T, err error) bool {
 		if err != nil {
@@ -372,19 +383,27 @@ func feedSeq[T any](
 			return false
 		}
 		buf = append(buf, v)
-		if len(buf) < size {
+		// Eager: publish a partial morsel when no work is outstanding —
+		// workers would otherwise idle. Under load the buffer fills to
+		// MorselSize as usual.
+		if len(buf) < size && !(eager && feed.Pending() == 0) {
 			return true
 		}
 		m := engine.Work[T]{Items: buf}
-		if !feed(m) {
+		if !feed.Publish(m) {
 			aborted = true
 			return false
 		}
-		buf = make([]T, 0, size)
+		if len(m.Items) < size {
+			// Partial (eager) morsel: stay small, regrow on demand.
+			buf = nil
+		} else {
+			buf = make([]T, 0, size)
+		}
 		return true
 	})
 	if !aborted && len(buf) > 0 {
-		feed(engine.Work[T]{Items: buf})
+		feed.Publish(engine.Work[T]{Items: buf})
 	}
 	return seqErr
 }
@@ -514,6 +533,45 @@ func (p Pipeline[Src, T]) FlatMap[U any](fn func(T) []U) Pipeline[Src, U] {
 	}
 }
 
+// batchStage wires a per-morsel transform into the pipeline. fn receives the
+// morsel's items and its return value is emitted as the next morsel, so it
+// may return any number of outputs (including none, which drops the morsel).
+// The batch is only valid during the call; do not retain it.
+func batchStage[Src, T, U any](p Pipeline[Src, T], fn func([]T) []U) Pipeline[Src, U] {
+	return Pipeline[Src, U]{
+		size: p.size,
+		feed: p.feed,
+		apply: func(m engine.Work[Src], emit func(engine.Work[U]) error) error {
+			if fn == nil {
+				return ErrNilFunction
+			}
+			return p.apply(m, func(out engine.Work[T]) error {
+				res := fn(out.Items)
+				if len(res) == 0 {
+					return nil
+				}
+				return emit(engine.Work[U]{Items: res})
+			})
+		},
+	}
+}
+
+// MapBatch transforms each morsel with fn. Unlike Map it may return any
+// number of outputs per batch.
+func (p Pipeline[Src, T]) MapBatch[U any](fn func([]T) []U) Pipeline[Src, U] {
+	return batchStage(p, fn)
+}
+
+// FilterBatch keeps the elements fn returns, dropping the rest of the morsel.
+func (p Pipeline[Src, T]) FilterBatch(fn func([]T) []T) Pipeline[Src, T] {
+	return batchStage(p, fn)
+}
+
+// FlatMapBatch transforms each morsel into zero or more elements.
+func (p Pipeline[Src, T]) FlatMapBatch[U any](fn func([]T) []U) Pipeline[Src, U] {
+	return batchStage(p, fn)
+}
+
 // ForEach consumes the pipeline, applying fn to every element.
 func (p Pipeline[Src, Out]) ForEach(fn func(Out), opts ...Option) error {
 	if fn == nil {
@@ -536,6 +594,31 @@ func (p Pipeline[Src, Out]) ForEachE(fn func(Out) error, opts ...Option) error {
 				}
 			}
 			return nil
+		})
+	}
+	_, err := p.run(ctx, ex, process, emptyState[Src], emptyMerge[Src])
+	return err
+}
+
+// ForEachBatch consumes the pipeline, applying fn once per morsel with the
+// morsel's items. The batch is only valid during the call; do not retain it.
+func (p Pipeline[Src, Out]) ForEachBatch(fn func([]Out), opts ...Option) error {
+	if fn == nil {
+		return ErrNilFunction
+	}
+	return p.ForEachEBatch(func(b []Out) error { fn(b); return nil }, opts...)
+}
+
+// ForEachEBatch is ForEachBatch for a fallible fn. The first error aborts
+// the run.
+func (p Pipeline[Src, Out]) ForEachEBatch(fn func([]Out) error, opts ...Option) error {
+	if fn == nil {
+		return ErrNilFunction
+	}
+	ctx, ex := resolve(opts)
+	process := func(_ *engine.Worker[Src, struct{}], m engine.Work[Src]) error {
+		return p.apply(m, func(out engine.Work[Out]) error {
+			return fn(out.Items)
 		})
 	}
 	_, err := p.run(ctx, ex, process, emptyState[Src], emptyMerge[Src])
@@ -577,6 +660,29 @@ func (p Pipeline[Src, Out]) Reduce[U any](
 			for _, v := range out.Items {
 				w.State = fold(w.State, v)
 			}
+			return nil
+		})
+	}
+	return p.run(ctx, ex, process,
+		func() U { return init },
+		func(dst *U, src U) { *dst = merge(*dst, src) })
+}
+
+// ReduceBatch is Reduce with fold applied once per morsel over the whole
+// batch. The batch is only valid during the call; do not retain it.
+func (p Pipeline[Src, Out]) ReduceBatch[U any](
+	init U,
+	fold func(U, []Out) U,
+	merge func(U, U) U,
+	opts ...Option,
+) (U, error) {
+	if fold == nil || merge == nil {
+		return init, ErrNilFunction
+	}
+	ctx, ex := resolve(opts)
+	process := func(w *engine.Worker[Src, U], m engine.Work[Src]) error {
+		return p.apply(m, func(out engine.Work[Out]) error {
+			w.State = fold(w.State, out.Items)
 			return nil
 		})
 	}

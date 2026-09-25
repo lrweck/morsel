@@ -139,6 +139,18 @@ func (r *Runner[T, S]) injectQueue() *queue.MPMC[Work[T]] {
 	return r.inject.Load()
 }
 
+// Publisher is the producer-facing view of a run: hand off morsels and
+// observe backlog. Pending reports published-but-unexecuted morsels; an eager
+// producer publishes a partial morsel when it is zero — workers would
+// otherwise idle — and keeps filling to MorselSize otherwise.
+type Publisher[T any] interface {
+	Publish(m Work[T]) bool
+	Pending() int64
+}
+
+// Pending reports published-but-unexecuted morsels.
+func (r *Runner[T, S]) Pending() int64 { return r.pending.Load() }
+
 // Publish hands a morsel directly to a worker queue, round-robin, so the hot
 // path is a single SPMC push instead of an injector hop. The shared MPMC
 // injector is only an overflow buffer for when every queue is full. The
@@ -295,11 +307,14 @@ func (w *Worker[T, S]) loop() {
 
 func (w *Worker[T, S]) execute(m Work[T]) {
 	r := w.run
-	r.pending.Add(-1)
 	w.stats.MorselsExecuted++
 	if err := invoke(r.cfg, r.process, w, m); err != nil {
 		r.fail(err)
 	}
+	// Decremented when the morsel is done, not when it starts, so Pending
+	// counts executing morsels too: zero means no work outstanding anywhere,
+	// and an eager producer publishes a partial only then.
+	r.pending.Add(-1)
 	r.signal()
 }
 
@@ -643,9 +658,13 @@ func RunIter[T, S any](
 	size := int(cfg.MorselSize)
 	buf := make([]T, 0, size)
 	aborted := false
+	eager := cfg.Eager
 	seq(func(v T) bool {
 		buf = append(buf, v)
-		if len(buf) < size {
+		// Eager: publish a partial morsel when no work is outstanding —
+		// workers would otherwise idle. Under load the buffer fills to
+		// MorselSize as usual.
+		if len(buf) < size && !(eager && r.Pending() == 0) {
 			return true
 		}
 		m := Work[T]{Items: buf}
@@ -653,7 +672,13 @@ func RunIter[T, S any](
 			aborted = true
 			return false
 		}
-		buf = make([]T, 0, size)
+		if len(m.Items) < size {
+			// Partial (eager) morsel: stay small instead of prepaying a
+			// full-size backing per slow item; it regrows on demand.
+			buf = nil
+		} else {
+			buf = make([]T, 0, size)
+		}
 		return true
 	})
 	if !aborted && len(buf) > 0 {
@@ -682,13 +707,15 @@ func runSequentialIter[T, S any](
 	buf := make([]T, 0, size)
 	var count uint64
 	var err error
+	eager := cfg.Eager
 	seq(func(v T) bool {
 		if ctx.Err() != nil {
 			err = ctx.Err()
 			return false
 		}
 		buf = append(buf, v)
-		if len(buf) < size {
+		// No queues on this path, so an eager run publishes every item.
+		if len(buf) < size && !eager {
 			return true
 		}
 		count++
@@ -696,7 +723,12 @@ func runSequentialIter[T, S any](
 			err = e
 			return false
 		}
-		buf = make([]T, 0, size)
+		if len(buf) < size {
+			// Partial (eager) morsel: stay small, regrow on demand.
+			buf = nil
+		} else {
+			buf = make([]T, 0, size)
+		}
 		return true
 	})
 	if err == nil && len(buf) > 0 {

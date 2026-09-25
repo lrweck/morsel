@@ -29,6 +29,7 @@ stealing**, **bounded** queues, and **zero dependencies**. Based on Leis et al.,
 - [Pipeline](#pipeline)
 - [Adapters (sources)](#adapters-sources)
 - [Streaming and resource usage](#streaming-and-resource-usage)
+- [Eager streams](#eager-streams)
 - [Errors and cancellation](#errors-and-cancellation)
 - [Reusable executor and stats](#reusable-executor-and-stats)
 - [Options](#options)
@@ -442,6 +443,26 @@ Resource sketch at defaults (`MaxWorkers=GOMAXPROCS`, `MorselSize=256`,
 | CPU when idle | ~0 (parked) |
 | CPU when busy | ≤ `MaxWorkers` cores |
 
+## Eager streams
+
+By default an iterator source fills each morsel to `MorselSize` before
+publishing it. On a slow stream — lines arriving far apart — that means
+waiting: with one line per second and the default 256-item morsel, the first
+result takes ~256 s. `Eager(true)` publishes a partial morsel whenever no
+work is outstanding instead, so the first line goes immediately and later
+morsels still fill under load:
+
+```go
+// First result in ~1 line-time instead of ~1 morsel-time.
+err := morsel.Lines(file).ForEach(process, morsel.Eager(true))
+```
+
+It also finishes whole runs earlier when the end comes early: finding a
+poison line at line 10 of a 2000-line stream aborts after ~10 line-times
+instead of waiting for 256 lines (buffered) or reading all 2000 (a
+collect-then-scan program). Partial morsels stay small (no preallocated
+backing per slow item); bulk throughput is unchanged.
+
 ## Errors and cancellation
 
 Every operation takes a `context` (via `WithContext` or the `ctx` parameter of
@@ -510,6 +531,7 @@ library uses `DefaultConfig()`:
 | `QueueCapacity` | `32` | capacity of each queue (bounded) |
 | `StealAttempts` | `4` | victims probed before parking |
 | `RecoverPanics` | `false` | turn a callback panic into an error |
+| `Eager` | `false` | publish a partial iterator morsel whenever no work is outstanding; under load morsels still fill to `MorselSize` |
 
 The numeric fields are **unsigned**, so an invalid (negative) configuration is
 impossible; `NewExecutor` cannot fail.
@@ -598,6 +620,20 @@ func (ex *Executor) ReduceSeq[T, R any](ctx context.Context, seq iter.Seq[T], in
 func (ex *Executor) Stats() Stats
 ```
 
+**Batch variants (optional):** every primitive above has a per-morsel form
+where the callback runs once per batch instead of once per element. The batch
+is only valid during the call — do not retain it:
+
+```go
+func (ex *Executor) ForEachSliceBatch[T any](ctx context.Context, data []T, fn func([]T) error) error
+func (ex *Executor) ForEachSeqBatch[T any](ctx context.Context, seq iter.Seq[T], fn func([]T) error) error
+func (ex *Executor) ForEachSeqErrBatch[T any](ctx context.Context, seq iter.Seq2[T, error], fn func([]T) error) error
+func (ex *Executor) MapSliceBatch[T, R any](ctx context.Context, data []T, fn func([]T) []R) ([]R, error)
+func (ex *Executor) MapSeqBatch[T, R any](ctx context.Context, seq iter.Seq[T], fn func([]T) []R) ([]R, error)
+func (ex *Executor) ReduceSliceBatch[T, R any](ctx context.Context, data []T, init R, fold func(R, []T) R, merge func(R, R) R) (R, error)
+func (ex *Executor) ReduceSeqBatch[T, R any](ctx context.Context, seq iter.Seq[T], init R, fold func(R, []T) R, merge func(R, R) R) (R, error)
+```
+
 **Package-level form of the slice primitives** (the shapes in the spec; the
 `Executor` methods above are the same calls):
 
@@ -618,6 +654,10 @@ func ForEachSeq[T any](seq iter.Seq[T], fn func(T), opts ...Option) error
 func ForEachSeqE[T any](seq iter.Seq[T], fn func(T) error, opts ...Option) error
 func ForEachSeqErr[T any](seq iter.Seq2[T, error], fn func(T) error, opts ...Option) error
 ```
+
+**Ergonomic batch variants** (`ForEachBatch`, `ForEachEBatch`,
+`ForEachSeqBatch`, `ForEachSeqEBatch`, `ForEachSeqErrBatch`) take
+`func([]T)` / `func([]T) error` instead, one call per morsel.
 
 **Pipeline:**
 
@@ -641,6 +681,11 @@ func (p Pipeline[Src, Out]) ForEachE(fn func(Out) error, opts ...Option) error
 func (p Pipeline[Src, Out]) Collect(opts ...Option) ([]Out, error)
 func (p Pipeline[Src, Out]) Reduce[U any](init U, fold func(U, Out) U, merge func(U, U) U, opts ...Option) (U, error)
 ```
+
+**Pipeline batch variants** (`MapBatch`, `FilterBatch`, `FlatMapBatch`,
+`ForEachBatch`, `ForEachEBatch`, `ReduceBatch`) take `func([]T) []U` /
+`fold func(U, []Out) U` instead, one call per morsel. Unlike `Map`, `MapBatch`
+may return any number of outputs per batch.
 
 **Types:**
 
