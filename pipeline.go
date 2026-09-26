@@ -135,17 +135,48 @@ func Slice[T any](data []T) Pipeline[T, T] {
 	}
 }
 
+// rangeSize returns the number of integers in [start, end) when that count is
+// representable as an int. The subtraction is done in uint64, so wide ranges
+// such as [math.MinInt, math.MaxInt) cannot overflow a signed int; those report
+// ok false and the caller treats the length as unknown. end < start is an empty
+// range and also reports false, keeping the size-based fast path off.
+func rangeSize(start, end int) (int, bool) {
+	if end < start {
+		return 0, false
+	}
+	n := uint64(end) - uint64(start)
+	if n > uint64(^uint(0)>>1) {
+		return 0, false
+	}
+	return int(n), true
+}
+
+// nextRangeEnd returns the exclusive end of the morsel starting at lo: the
+// smaller of lo+size and end. The arithmetic is done in uint64, so it cannot
+// overflow a signed int when lo or end is near math.MaxInt.
+func nextRangeEnd(lo, end int, size uint) int {
+	remaining := uint64(end) - uint64(lo)
+	if uint64(size) >= remaining {
+		return end
+	}
+	return int(uint64(lo) + uint64(size))
+}
+
 // Range produces the integers in [start, end).
 func Range(start, end int) Pipeline[int, int] {
+	size, known := rangeSize(start, end)
+	if !known {
+		size = -1
+	}
 	return Pipeline[int, int]{
-		size: end - start,
+		size: size,
 		feed: func(ex *Executor, ctx context.Context, feed engine.Publisher[int]) error {
-			size := int(ex.cfg.MorselSize)
-			for lo := start; lo < end; lo += size {
+			step := ex.cfg.MorselSize
+			for lo := start; lo < end; {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				hi := min(lo+size, end)
+				hi := nextRangeEnd(lo, end, step)
 				items := make([]int, hi-lo)
 				for i := range items {
 					items[i] = lo + i
@@ -153,6 +184,7 @@ func Range(start, end int) Pipeline[int, int] {
 				if !feed.Publish(engine.Work[int]{Items: items}) {
 					return nil
 				}
+				lo = hi
 			}
 			return nil
 		},
