@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/lrweck/morsel/internal/queue"
 )
@@ -61,6 +62,13 @@ type Runner[T, S any] struct {
 	stopClosed   atomic.Bool
 	err          error
 
+	// morselSize is the current adaptive morsel size, read by the producer and
+	// written by workers that observe their morsels. emaNs is the smoothed
+	// per-morsel time driving it. Both are untouched unless adaptive sizing is
+	// enabled.
+	morselSize atomic.Uint64
+	emaNs      atomic.Int64
+
 	wg sync.WaitGroup
 }
 
@@ -87,7 +95,18 @@ func NewRunner[T, S any](
 		workers:  make([]*Worker[T, S], cfg.MaxWorkers),
 	}
 	r.cond.L = &r.mu
+	r.morselSize.Store(morselSizeFor(cfg))
 	return r
+}
+
+// morselSizeFor returns the initial morsel size for a run: the configured size,
+// clamped into the adaptive range when adaptive sizing is enabled.
+func morselSizeFor(cfg Config) uint64 {
+	size := uint64(cfg.MorselSize)
+	if !cfg.AdaptiveMorselSize {
+		return size
+	}
+	return min(max(size, uint64(cfg.MinMorselSize)), uint64(cfg.MaxMorselSize))
 }
 
 func (r *Runner[T, S]) isDone() bool {
@@ -146,10 +165,17 @@ func (r *Runner[T, S]) injectQueue() *queue.MPMC[Work[T]] {
 type Publisher[T any] interface {
 	Publish(m Work[T]) bool
 	Pending() int64
+	// MorselSize reports the size to use for the next morsel. It is the fixed
+	// configured size, or the current adaptive size when adaptive sizing is
+	// enabled.
+	MorselSize() uint
 }
 
 // Pending reports published-but-unexecuted morsels.
 func (r *Runner[T, S]) Pending() int64 { return r.pending.Load() }
+
+// MorselSize reports the current morsel size.
+func (r *Runner[T, S]) MorselSize() uint { return uint(r.morselSize.Load()) }
 
 // Publish hands a morsel directly to a worker queue, round-robin, so the hot
 // path is a single SPMC push instead of an injector hop. The shared MPMC
@@ -308,7 +334,14 @@ func (w *Worker[T, S]) loop() {
 func (w *Worker[T, S]) execute(m Work[T]) {
 	r := w.run
 	w.stats.MorselsExecuted++
-	if err := invoke(r.cfg, r.process, w, m); err != nil {
+	if r.cfg.AdaptiveMorselSize {
+		start := time.Now()
+		err := invoke(r.cfg, r.process, w, m)
+		r.observe(time.Since(start))
+		if err != nil {
+			r.fail(err)
+		}
+	} else if err := invoke(r.cfg, r.process, w, m); err != nil {
 		r.fail(err)
 	}
 	// Decremented when the morsel is done, not when it starts, so Pending
@@ -316,6 +349,48 @@ func (w *Worker[T, S]) execute(m Work[T]) {
 	// and an eager producer publishes a partial only then.
 	r.pending.Add(-1)
 	r.signal()
+}
+
+// observe folds one morsel's processing time into the adaptive size. It is
+// called only when adaptive sizing is enabled, so the default path pays no
+// timing cost. The size applies to future morsels only.
+func (r *Runner[T, S]) observe(d time.Duration) {
+	target := int64(r.cfg.TargetMorselTime)
+	if target <= 0 {
+		return
+	}
+	dns := d.Nanoseconds()
+	for {
+		old := r.emaNs.Load()
+		// Exponentially smoothed measurement: ema = (ema*7 + elapsed) / 8.
+		next := dns
+		if old > 0 {
+			next = (old*7 + dns) / 8
+		}
+		if r.emaNs.CompareAndSwap(old, next) {
+			break
+		}
+	}
+	ema := r.emaNs.Load()
+	grow := ema < target/2
+	shrink := ema > target*2
+	if !grow && !shrink {
+		return
+	}
+	minSize := uint64(r.cfg.MinMorselSize)
+	maxSize := uint64(r.cfg.MaxMorselSize)
+	for {
+		cur := r.morselSize.Load()
+		var next uint64
+		if grow {
+			next = min(cur*2, maxSize)
+		} else {
+			next = max(cur/2, minSize)
+		}
+		if next == cur || r.morselSize.CompareAndSwap(cur, next) {
+			return
+		}
+	}
 }
 
 // invoke runs process, optionally turning a user panic into an error. An
@@ -558,6 +633,8 @@ func (r *Runner[T, S]) reset(
 	r.producerDone.Store(false)
 	r.stopped.Store(false)
 	r.live.Store(0)
+	r.morselSize.Store(morselSizeFor(cfg))
+	r.emaNs.Store(0)
 
 	r.mu.Lock()
 	r.err = nil
@@ -603,16 +680,17 @@ func RunSlice[T, S any](
 		return runSequentialSlice(ctx, cfg, data, process, newState, merge)
 	}
 	r := acquireRunner(cfg, ctx, process, newState)
-	size := int(cfg.MorselSize)
 	// Sequence is assigned serially by this single producer, so no atomic: it
 	// is the morsel's logical position, independent of the slice offsets.
 	var sequence uint64
-	for start := 0; start < len(data); start += size {
+	for start := 0; start < len(data); {
+		size := int(r.MorselSize())
 		end := min(start+size, len(data))
 		if !r.Publish(Work[T]{Start: start, Sequence: sequence, Items: data[start:end]}) {
 			break
 		}
 		sequence++
+		start = end
 	}
 	r.Done()
 	stats, err := r.Wait()
@@ -670,7 +748,7 @@ func RunIter[T, S any](
 		return runSequentialIter(ctx, cfg, seq, process, newState, merge)
 	}
 	r := acquireRunner(cfg, ctx, process, newState)
-	size := int(cfg.MorselSize)
+	size := int(r.MorselSize())
 	buf := make([]T, 0, size)
 	aborted := false
 	eager := cfg.Eager
@@ -689,12 +767,14 @@ func RunIter[T, S any](
 			return false
 		}
 		sequence++
-		if len(m.Items) < size {
+		full := len(m.Items) >= size
+		size = int(r.MorselSize())
+		if full {
+			buf = make([]T, 0, size)
+		} else {
 			// Partial (eager) morsel: stay small instead of prepaying a
 			// full-size backing per slow item; it regrows on demand.
 			buf = nil
-		} else {
-			buf = make([]T, 0, size)
 		}
 		return true
 	})

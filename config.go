@@ -1,6 +1,10 @@
 package morsel
 
-import "github.com/lrweck/morsel/internal/engine"
+import (
+	"time"
+
+	"github.com/lrweck/morsel/internal/engine"
+)
 
 // Config controls a single run. The zero value is valid and normalizes to
 // [DefaultConfig]. The fields are unsigned so a negative value is impossible.
@@ -25,6 +29,18 @@ type Config struct {
 	// waiting to fill it to MorselSize. Under load morsels still fill as
 	// usual. Slice sources already publish immediately and ignore it.
 	Eager bool
+	// AdaptiveMorselSize makes the producer resize future morsels from the
+	// per-morsel processing time workers observe, targeting TargetMorselTime.
+	// Morsels already queued keep their size. It is opt-in so the default hot
+	// path pays no timing cost.
+	AdaptiveMorselSize bool
+	// MinMorselSize and MaxMorselSize bound the adaptive size. Zero means 64
+	// and 8192. They are ignored unless AdaptiveMorselSize is set.
+	MinMorselSize uint
+	MaxMorselSize uint
+	// TargetMorselTime is the per-morsel time adaptive sizing aims for. Zero
+	// means 1ms. It is ignored unless AdaptiveMorselSize is set.
+	TargetMorselTime time.Duration
 }
 
 // DefaultConfig returns the default configuration.
@@ -50,22 +66,30 @@ type Stats struct {
 
 func (c Config) engine() engine.Config {
 	return engine.Config{
-		MaxWorkers:    c.MaxWorkers,
-		MorselSize:    c.MorselSize,
-		QueueCapacity: c.QueueCapacity,
-		StealAttempts: c.StealAttempts,
-		RecoverPanics: c.RecoverPanics,
-		Eager:         c.Eager,
+		MaxWorkers:         c.MaxWorkers,
+		MorselSize:         c.MorselSize,
+		QueueCapacity:      c.QueueCapacity,
+		StealAttempts:      c.StealAttempts,
+		RecoverPanics:      c.RecoverPanics,
+		Eager:              c.Eager,
+		AdaptiveMorselSize: c.AdaptiveMorselSize,
+		MinMorselSize:      c.MinMorselSize,
+		MaxMorselSize:      c.MaxMorselSize,
+		TargetMorselTime:   c.TargetMorselTime,
 	}
 }
 
 func configFromEngine(c engine.Config) Config {
 	return Config{
-		MaxWorkers:    c.MaxWorkers,
-		MorselSize:    c.MorselSize,
-		QueueCapacity: c.QueueCapacity,
-		StealAttempts: c.StealAttempts,
-		RecoverPanics: c.RecoverPanics,
-		Eager:         c.Eager,
+		MaxWorkers:         c.MaxWorkers,
+		MorselSize:         c.MorselSize,
+		QueueCapacity:      c.QueueCapacity,
+		StealAttempts:      c.StealAttempts,
+		RecoverPanics:      c.RecoverPanics,
+		Eager:              c.Eager,
+		AdaptiveMorselSize: c.AdaptiveMorselSize,
+		MinMorselSize:      c.MinMorselSize,
+		MaxMorselSize:      c.MaxMorselSize,
+		TargetMorselTime:   c.TargetMorselTime,
 	}
 }

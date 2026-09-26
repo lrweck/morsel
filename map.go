@@ -76,6 +76,10 @@ func (ex *Executor) MapSliceBatch[T, R any](ctx context.Context, data []T, fn fu
 	if size <= 0 {
 		size = max(len(data), 1)
 	}
+	// Part i is filled from m.Start/size, so this source needs a fixed morsel
+	// size; adaptive sizing would move the boundaries and misindex the parts.
+	cfg := ex.cfg
+	cfg.AdaptiveMorselSize = false
 	parts := make([][]R, (len(data)+size-1)/size)
 	process := func(_ *engine.Worker[T, struct{}], m engine.Work[T]) error {
 		// Sequence is the producer-assigned logical position, so the batch
@@ -83,7 +87,7 @@ func (ex *Executor) MapSliceBatch[T, R any](ctx context.Context, data []T, fn fu
 		parts[m.Sequence] = fn(m.Items)
 		return nil
 	}
-	_, stats, err := engine.RunSlice(ex.cfg, ctx, data, process, emptyState[T], emptyMerge[T])
+	_, stats, err := engine.RunSlice(cfg, ctx, data, process, emptyState[T], emptyMerge[T])
 	ex.record(stats)
 	if err != nil {
 		return nil, err

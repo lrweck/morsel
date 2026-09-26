@@ -532,9 +532,32 @@ library uses `DefaultConfig()`:
 | `StealAttempts` | `4` | victims probed before parking |
 | `RecoverPanics` | `false` | turn a callback panic into an error |
 | `Eager` | `false` | publish a partial iterator morsel whenever no work is outstanding; under load morsels still fill to `MorselSize` |
+| `AdaptiveMorselSize` | `false` | resize future morsels from the per-morsel time workers observe |
+| `MinMorselSize` | `64` | adaptive lower bound (ignored unless adaptive) |
+| `MaxMorselSize` | `8192` | adaptive upper bound (ignored unless adaptive) |
+| `TargetMorselTime` | `1ms` | per-morsel time adaptive sizing aims for |
 
 The numeric fields are **unsigned**, so an invalid (negative) configuration is
 impossible; `NewExecutor` cannot fail.
+
+### Adaptive morsel sizing (opt-in)
+
+`MorselSize` is a static compromise: small morsels balance load better, large
+ones cut scheduler overhead. `AdaptiveMorselSize` lets the producer resize
+future morsels from an exponentially smoothed measurement of how long workers
+take per morsel, targeting `TargetMorselTime` and clamped to
+`[MinMorselSize, MaxMorselSize]`. Morsels already queued keep their size.
+
+It is off by default: when disabled, workers take no timestamps, so the normal
+path pays nothing. Turn it on when a single fixed size cannot serve a workload
+whose per-element cost is unknown or uneven:
+
+```go
+morsel.ForEachE(data, work,
+	morsel.AdaptiveMorselSize(true),
+	morsel.TargetMorselTime(time.Millisecond),
+)
+```
 
 Pass only what you want to override, as trailing `Option` arguments:
 

@@ -45,10 +45,12 @@ type Pipeline[Src, Out any] struct {
 // every item immediately on the sequential path.
 type inlinePublisher[T any] struct {
 	publish func(engine.Work[T]) bool
+	size    uint
 }
 
 func (p inlinePublisher[T]) Publish(m engine.Work[T]) bool { return p.publish(m) }
 func (p inlinePublisher[T]) Pending() int64                { return 0 }
+func (p inlinePublisher[T]) MorselSize() uint              { return p.size }
 
 // run wires the source into a fresh engine run and drives it to completion.
 //
@@ -87,7 +89,7 @@ func (p Pipeline[Src, Out]) runSequential[S any](
 	w := &engine.Worker[Src, S]{State: newState()}
 	var runErr error
 	var morsels uint64
-	feedErr := p.feed(ex, ctx, inlinePublisher[Src]{publish: func(m engine.Work[Src]) bool {
+	feedErr := p.feed(ex, ctx, inlinePublisher[Src]{size: ex.cfg.MorselSize, publish: func(m engine.Work[Src]) bool {
 		if ctx.Err() != nil {
 			runErr = ctx.Err()
 			return false
@@ -119,18 +121,19 @@ func Slice[T any](data []T) Pipeline[T, T] {
 	return Pipeline[T, T]{
 		size: len(data),
 		feed: func(ex *Executor, ctx context.Context, feed engine.Publisher[T]) error {
-			size := int(ex.cfg.MorselSize)
 			var sequence uint64
-			for start := 0; start < len(data); start += size {
+			for start := 0; start < len(data); {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
+				size := int(feed.MorselSize())
 				end := min(start+size, len(data))
 				m := engine.Work[T]{Start: start, Sequence: sequence, Items: data[start:end]}
 				sequence++
 				if !feed.Publish(m) {
 					return nil
 				}
+				start = end
 			}
 			return nil
 		},
@@ -174,13 +177,12 @@ func Range(start, end int) Pipeline[int, int] {
 	return Pipeline[int, int]{
 		size: size,
 		feed: func(ex *Executor, ctx context.Context, feed engine.Publisher[int]) error {
-			step := ex.cfg.MorselSize
 			var sequence uint64
 			for lo := start; lo < end; {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				hi := nextRangeEnd(lo, end, step)
+				hi := nextRangeEnd(lo, end, feed.MorselSize())
 				items := make([]int, hi-lo)
 				for i := range items {
 					items[i] = lo + i
@@ -410,7 +412,7 @@ func feedSeq[T any](
 	feed engine.Publisher[T],
 	seq iter.Seq2[T, error],
 ) error {
-	size := int(ex.cfg.MorselSize)
+	size := int(feed.MorselSize())
 	buf := make([]T, 0, size)
 	aborted := false
 	eager := ex.cfg.Eager
@@ -438,11 +440,13 @@ func feedSeq[T any](
 			return false
 		}
 		sequence++
-		if len(m.Items) < size {
+		full := len(m.Items) >= size
+		size = int(feed.MorselSize())
+		if full {
+			buf = make([]T, 0, size)
+		} else {
 			// Partial (eager) morsel: stay small, regrow on demand.
 			buf = nil
-		} else {
-			buf = make([]T, 0, size)
 		}
 		return true
 	})
