@@ -69,13 +69,3 @@ func configFromEngine(c engine.Config) Config {
 		Eager:         c.Eager,
 	}
 }
-
-func statsFromEngine(s engine.Stats) Stats {
-	return Stats{
-		MorselsCreated:  s.MorselsCreated,
-		MorselsExecuted: s.MorselsExecuted,
-		StealsAttempted: s.StealsAttempted,
-		StealsSucceeded: s.StealsSucceeded,
-		WorkersCreated:  s.WorkersCreated,
-	}
-}
