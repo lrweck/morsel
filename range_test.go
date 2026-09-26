@@ -100,17 +100,20 @@ func TestRangeBoundaries(t *testing.T) {
 }
 
 // recordingPublisher keeps the first limit morsels and then stops the feed, so
-// a huge range can be split and inspected without executing every element.
+// a huge range can be split and inspected without executing every element. It
+// materializes range morsels the way the engine would.
 type recordingPublisher[T any] struct {
 	limit int
 	size  uint
 	got   [][]T
+	buf   []int
 }
 
 func (p *recordingPublisher[T]) Publish(m engine.Work[T]) bool {
 	if p.limit > 0 && len(p.got) >= p.limit {
 		return false
 	}
+	m, p.buf = engine.MaterializeRange(m, p.buf)
 	p.got = append(p.got, slices.Clone(m.Items))
 	return true
 }

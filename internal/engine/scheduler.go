@@ -33,6 +33,10 @@ type Worker[T, S any] struct {
 	run   *Runner[T, S]
 	rng   uint64
 	stats WorkerStats
+	// intBuf backs a materialized int range morsel. It is owned by the worker
+	// and reused for the next range morsel; nothing outside the worker may
+	// retain it.
+	intBuf []int
 }
 
 // Runner is the logical state of one execution. It is created per run, never
@@ -333,6 +337,9 @@ func (w *Worker[T, S]) loop() {
 
 func (w *Worker[T, S]) execute(m Work[T]) {
 	r := w.run
+	if m.Kind == WorkIntRange {
+		m, w.intBuf = MaterializeRange(m, w.intBuf)
+	}
 	w.stats.MorselsExecuted++
 	if r.cfg.AdaptiveMorselSize {
 		start := time.Now()
@@ -605,6 +612,7 @@ func releaseRunner[T, S any](r *Runner[T, S]) {
 		if w != nil {
 			w.State = zero
 			w.stats = WorkerStats{}
+			w.intBuf = nil
 		}
 	}
 	runnerPool[T, S](r.cfg).Put(r)
