@@ -8,7 +8,12 @@ package engine
 // source that recycles element buffers (see ChunksPooled) uses it to return them
 // to its pool, so its elements are only valid until Release runs.
 type Work[T any] struct {
-	Start   int
-	Items   []T
-	Release func()
+	Start int
+	// Sequence is the morsel's logical position in the source, assigned
+	// serially by the single producer (no atomic). Unlike Start it is
+	// meaningful for sources without random access, so an ordered batch
+	// consumer can index by it: parts[Sequence].
+	Sequence uint64
+	Items    []T
+	Release  func()
 }

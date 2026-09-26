@@ -120,12 +120,15 @@ func Slice[T any](data []T) Pipeline[T, T] {
 		size: len(data),
 		feed: func(ex *Executor, ctx context.Context, feed engine.Publisher[T]) error {
 			size := int(ex.cfg.MorselSize)
+			var sequence uint64
 			for start := 0; start < len(data); start += size {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
 				end := min(start+size, len(data))
-				if !feed.Publish(engine.Work[T]{Start: start, Items: data[start:end]}) {
+				m := engine.Work[T]{Start: start, Sequence: sequence, Items: data[start:end]}
+				sequence++
+				if !feed.Publish(m) {
 					return nil
 				}
 			}
@@ -172,6 +175,7 @@ func Range(start, end int) Pipeline[int, int] {
 		size: size,
 		feed: func(ex *Executor, ctx context.Context, feed engine.Publisher[int]) error {
 			step := ex.cfg.MorselSize
+			var sequence uint64
 			for lo := start; lo < end; {
 				if ctx.Err() != nil {
 					return ctx.Err()
@@ -181,7 +185,9 @@ func Range(start, end int) Pipeline[int, int] {
 				for i := range items {
 					items[i] = lo + i
 				}
-				if !feed.Publish(engine.Work[int]{Items: items}) {
+				m := engine.Work[int]{Sequence: sequence, Items: items}
+				sequence++
+				if !feed.Publish(m) {
 					return nil
 				}
 				lo = hi
@@ -230,16 +236,18 @@ func From[T any](src Source[T]) Pipeline[T, T] {
 			if src == nil {
 				return ErrNilSource
 			}
+			var sequence uint64
 			return src(func(m Batch[T]) bool {
 				if ctx.Err() != nil {
 					releaseBatch(m)
 					return false
 				}
-				if !feed.Publish(engine.Work[T]{Items: m.Items, Release: m.Release}) {
+				if !feed.Publish(engine.Work[T]{Sequence: sequence, Items: m.Items, Release: m.Release}) {
 					// Not taken: the engine will never see it, so release here.
 					releaseBatch(m)
 					return false
 				}
+				sequence++
 				return true
 			})
 		},
@@ -324,16 +332,18 @@ func ChunksPooled(r io.Reader, size int) Pipeline[[]byte, []byte] {
 				cb.release = func() { pool.Put(cb) }
 				return cb
 			}
+			var sequence uint64
 			for {
 				cb := pool.Get().(*chunkBuf)
 				n, err := r.Read(cb.buf)
 				if n > 0 {
 					cb.items[0] = cb.buf[:n]
-					m := engine.Work[[]byte]{Items: cb.items[:], Release: cb.release}
+					m := engine.Work[[]byte]{Sequence: sequence, Items: cb.items[:], Release: cb.release}
 					if !feed.Publish(m) {
 						pool.Put(cb)
 						return nil
 					}
+					sequence++
 				} else {
 					pool.Put(cb)
 				}
@@ -405,6 +415,7 @@ func feedSeq[T any](
 	aborted := false
 	eager := ex.cfg.Eager
 	var seqErr error
+	var sequence uint64
 	seq(func(v T, err error) bool {
 		if err != nil {
 			seqErr = err
@@ -421,11 +432,12 @@ func feedSeq[T any](
 		if len(buf) < size && !(eager && feed.Pending() == 0) {
 			return true
 		}
-		m := engine.Work[T]{Items: buf}
+		m := engine.Work[T]{Sequence: sequence, Items: buf}
 		if !feed.Publish(m) {
 			aborted = true
 			return false
 		}
+		sequence++
 		if len(m.Items) < size {
 			// Partial (eager) morsel: stay small, regrow on demand.
 			buf = nil
@@ -435,7 +447,7 @@ func feedSeq[T any](
 		return true
 	})
 	if !aborted && len(buf) > 0 {
-		feed.Publish(engine.Work[T]{Items: buf})
+		feed.Publish(engine.Work[T]{Sequence: sequence, Items: buf})
 	}
 	return seqErr
 }

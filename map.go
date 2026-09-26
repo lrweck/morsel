@@ -78,7 +78,9 @@ func (ex *Executor) MapSliceBatch[T, R any](ctx context.Context, data []T, fn fu
 	}
 	parts := make([][]R, (len(data)+size-1)/size)
 	process := func(_ *engine.Worker[T, struct{}], m engine.Work[T]) error {
-		parts[m.Start/size] = fn(m.Items)
+		// Sequence is the producer-assigned logical position, so the batch
+		// writes its own slot: no lock, no append, order preserved.
+		parts[m.Sequence] = fn(m.Items)
 		return nil
 	}
 	_, stats, err := engine.RunSlice(ex.cfg, ctx, data, process, emptyState[T], emptyMerge[T])

@@ -604,11 +604,15 @@ func RunSlice[T, S any](
 	}
 	r := acquireRunner(cfg, ctx, process, newState)
 	size := int(cfg.MorselSize)
+	// Sequence is assigned serially by this single producer, so no atomic: it
+	// is the morsel's logical position, independent of the slice offsets.
+	var sequence uint64
 	for start := 0; start < len(data); start += size {
 		end := min(start+size, len(data))
-		if !r.Publish(Work[T]{Start: start, Items: data[start:end]}) {
+		if !r.Publish(Work[T]{Start: start, Sequence: sequence, Items: data[start:end]}) {
 			break
 		}
+		sequence++
 	}
 	r.Done()
 	stats, err := r.Wait()
@@ -639,7 +643,8 @@ func runSequentialSlice[T, S any](
 		}
 		end := min(start+size, len(data))
 		count++
-		if e := invoke(cfg, process, w, Work[T]{Start: start, Items: data[start:end]}); e != nil {
+		m := Work[T]{Start: start, Sequence: count - 1, Items: data[start:end]}
+		if e := invoke(cfg, process, w, m); e != nil {
 			err = e
 			break
 		}
@@ -669,6 +674,7 @@ func RunIter[T, S any](
 	buf := make([]T, 0, size)
 	aborted := false
 	eager := cfg.Eager
+	var sequence uint64
 	seq(func(v T) bool {
 		buf = append(buf, v)
 		// Eager: publish a partial morsel when no work is outstanding —
@@ -677,11 +683,12 @@ func RunIter[T, S any](
 		if len(buf) < size && !(eager && r.Pending() == 0) {
 			return true
 		}
-		m := Work[T]{Items: buf}
+		m := Work[T]{Sequence: sequence, Items: buf}
 		if !r.Publish(m) {
 			aborted = true
 			return false
 		}
+		sequence++
 		if len(m.Items) < size {
 			// Partial (eager) morsel: stay small instead of prepaying a
 			// full-size backing per slow item; it regrows on demand.
@@ -692,7 +699,7 @@ func RunIter[T, S any](
 		return true
 	})
 	if !aborted && len(buf) > 0 {
-		r.Publish(Work[T]{Items: buf})
+		r.Publish(Work[T]{Sequence: sequence, Items: buf})
 	}
 	r.Done()
 	stats, err := r.Wait()
@@ -729,7 +736,7 @@ func runSequentialIter[T, S any](
 			return true
 		}
 		count++
-		if e := invoke(cfg, process, w, Work[T]{Items: buf}); e != nil {
+		if e := invoke(cfg, process, w, Work[T]{Sequence: count - 1, Items: buf}); e != nil {
 			err = e
 			return false
 		}
@@ -743,7 +750,7 @@ func runSequentialIter[T, S any](
 	})
 	if err == nil && len(buf) > 0 {
 		count++
-		if e := invoke(cfg, process, w, Work[T]{Items: buf}); e != nil {
+		if e := invoke(cfg, process, w, Work[T]{Sequence: count - 1, Items: buf}); e != nil {
 			err = e
 		}
 	}

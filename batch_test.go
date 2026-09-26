@@ -128,6 +128,38 @@ func TestBatchMapSliceOrderAndFilter(t *testing.T) {
 	}
 }
 
+func TestMapSliceBatchExactOrder(t *testing.T) {
+	for _, tc := range []struct{ n, morsel int }{
+		{0, 4}, {1, 4}, {3, 4}, {4, 4}, {5, 4}, {9, 4}, {100, 8}, {1000, 256},
+	} {
+		data := make([]int, tc.n)
+		for i := range data {
+			data[i] = i
+		}
+		ex := NewExecutor(Config{MaxWorkers: 4, MorselSize: uint(tc.morsel), QueueCapacity: 64, StealAttempts: 4})
+		got, err := ex.MapSliceBatch(context.Background(), data, func(b []int) []int {
+			// Two outputs per input element and a partial last morsel, so a
+			// wrong slot shows up as misordered elements.
+			out := make([]int, 0, 2*len(b))
+			for _, v := range b {
+				out = append(out, v, v)
+			}
+			return out
+		})
+		if err != nil {
+			t.Fatalf("n=%d morsel=%d: %v", tc.n, tc.morsel, err)
+		}
+		if want := 2 * tc.n; len(got) != want {
+			t.Fatalf("n=%d morsel=%d: len = %d, want %d", tc.n, tc.morsel, len(got), want)
+		}
+		for i, v := range got {
+			if want := i / 2; v != want {
+				t.Fatalf("n=%d morsel=%d: got[%d] = %d, want %d", tc.n, tc.morsel, i, v, want)
+			}
+		}
+	}
+}
+
 func TestBatchMapSeqAndReduce(t *testing.T) {
 	ex := testExecutor()
 	seq := func(yield func(int) bool) {
