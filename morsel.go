@@ -49,6 +49,7 @@ import (
 	"context"
 	"errors"
 	"iter"
+	"time"
 )
 
 var (
@@ -77,6 +78,25 @@ func MaxWorkers(n uint) Option { return func(o *options) { o.MaxWorkers = n } }
 
 // MorselSize sets the number of items per morsel.
 func MorselSize(n uint) Option { return func(o *options) { o.MorselSize = n } }
+
+// AdaptiveMorselSize enables adaptive morsel sizing: the producer resizes
+// future morsels from the per-morsel processing time workers observe, aiming
+// for TargetMorselTime and staying within MinMorselSize and MaxMorselSize.
+func AdaptiveMorselSize(enable bool) Option {
+	return func(o *options) { o.AdaptiveMorselSize = enable }
+}
+
+// MinMorselSize sets the lower bound for adaptive morsel sizing.
+func MinMorselSize(n uint) Option { return func(o *options) { o.MinMorselSize = n } }
+
+// MaxMorselSize sets the upper bound for adaptive morsel sizing.
+func MaxMorselSize(n uint) Option { return func(o *options) { o.MaxMorselSize = n } }
+
+// TargetMorselTime sets the per-morsel processing time adaptive sizing aims
+// for.
+func TargetMorselTime(d time.Duration) Option {
+	return func(o *options) { o.TargetMorselTime = d }
+}
 
 // QueueCapacity sets the bounded capacity of each worker queue and of the
 // injection queue.

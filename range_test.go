@@ -103,6 +103,7 @@ func TestRangeBoundaries(t *testing.T) {
 // a huge range can be split and inspected without executing every element.
 type recordingPublisher[T any] struct {
 	limit int
+	size  uint
 	got   [][]T
 }
 
@@ -116,12 +117,14 @@ func (p *recordingPublisher[T]) Publish(m engine.Work[T]) bool {
 
 func (p *recordingPublisher[T]) Pending() int64 { return 0 }
 
+func (p *recordingPublisher[T]) MorselSize() uint { return p.size }
+
 // TestRangeExtremeSplitsWithoutExecuting constructs and splits the full
 // [MinInt, MaxInt) range. The publisher stops after two morsels, so only eight
 // elements are ever built; the rest of the range is never executed.
 func TestRangeExtremeSplitsWithoutExecuting(t *testing.T) {
 	ex := NewExecutor(Config{MorselSize: 4})
-	pub := &recordingPublisher[int]{limit: 2}
+	pub := &recordingPublisher[int]{limit: 2, size: 4}
 	p := Range(math.MinInt, math.MaxInt)
 	if p.size != -1 {
 		t.Fatalf("size = %d, want -1 for an unrepresentable range", p.size)
@@ -146,7 +149,7 @@ func TestRangeExtremeSplitsWithoutExecuting(t *testing.T) {
 // TestRangeMaxIntSplits guards the lo+size overflow at the top of the int range.
 func TestRangeMaxIntSplits(t *testing.T) {
 	ex := NewExecutor(Config{MorselSize: 4})
-	pub := &recordingPublisher[int]{}
+	pub := &recordingPublisher[int]{size: 4}
 	if err := Range(math.MaxInt-6, math.MaxInt).feed(ex, context.Background(), pub); err != nil {
 		t.Fatal(err)
 	}
