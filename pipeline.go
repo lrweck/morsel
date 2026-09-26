@@ -89,12 +89,14 @@ func (p Pipeline[Src, Out]) runSequential[S any](
 	w := &engine.Worker[Src, S]{State: newState()}
 	var runErr error
 	var morsels uint64
+	var intBuf []int
 	feedErr := p.feed(ex, ctx, inlinePublisher[Src]{size: ex.cfg.MorselSize, publish: func(m engine.Work[Src]) bool {
 		if ctx.Err() != nil {
 			runErr = ctx.Err()
 			return false
 		}
 		morsels++
+		m, intBuf = engine.MaterializeRange(m, intBuf)
 		err := process(w, m)
 		if m.Release != nil {
 			m.Release()
@@ -168,7 +170,9 @@ func nextRangeEnd(lo, end int, size uint) int {
 	return int(uint64(lo) + uint64(size))
 }
 
-// Range produces the integers in [start, end).
+// Range produces the integers in [start, end). Each morsel is published as a
+// descriptor — no int slice is built by the producer — and the engine
+// materializes it into a reusable per-worker buffer.
 func Range(start, end int) Pipeline[int, int] {
 	size, known := rangeSize(start, end)
 	if !known {
@@ -183,15 +187,10 @@ func Range(start, end int) Pipeline[int, int] {
 					return ctx.Err()
 				}
 				hi := nextRangeEnd(lo, end, feed.MorselSize())
-				items := make([]int, hi-lo)
-				for i := range items {
-					items[i] = lo + i
-				}
-				m := engine.Work[int]{Sequence: sequence, Items: items}
-				sequence++
-				if !feed.Publish(m) {
+				if !feed.Publish(engine.Work[int]{Kind: engine.WorkIntRange, Start: lo, End: hi, Sequence: sequence}) {
 					return nil
 				}
+				sequence++
 				lo = hi
 			}
 			return nil
