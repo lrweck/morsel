@@ -385,9 +385,19 @@ func (r *Runner[T, S]) steal(w *Worker[T, S]) (Work[T], bool) {
 	return Work[T]{}, false
 }
 
+// parkHook, when non-nil, runs at the top of park, before the worker takes the
+// lock and blocks. It exists only for tests: a stress test installs a barrier
+// to force the publish/signal-before-wait interleaving that would expose a lost
+// wake-up. It is deliberately a bare nil check in production, and is only ever
+// set by tests in this package.
+var parkHook func()
+
 // park blocks until the worker is notified of new local work or the run stops.
 // No channel and no counter: the producer wakes exactly the worker it fed.
 func (r *Runner[T, S]) park(w *Worker[T, S]) bool {
+	if parkHook != nil {
+		parkHook()
+	}
 	w.mu.Lock()
 	for !w.ready {
 		if r.stopped.Load() {
